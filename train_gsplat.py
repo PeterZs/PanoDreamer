@@ -205,7 +205,7 @@ def prepare_training_targets(views, device='cuda'):
     targets = []
     for view in tqdm(views, desc="Preparing targets"):
         rgba_layers = view['rgba_layers']  # [num_layers, H, W, 4]
-        depth_layers = view['depth_layers']  # [num_layers, H, W]
+        depth_layers = np.clip(view['depth_layers'], 0, 200)  # clamp extreme depths
         num_layers, H, W, _ = rgba_layers.shape
         
         # Prepare per-layer composited targets (following reference logic)
@@ -242,7 +242,7 @@ def prepare_training_targets(views, device='cuda'):
     return targets
 
 
-def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
+def unproject_panorama_to_points(rgba_ldi, depth_ldi, init_opacity=0.05, device='cuda'):
     """
     Directly unproject panorama LDI to 3D point cloud using cylindrical geometry.
 
@@ -260,6 +260,7 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
         alphas: [N] tensor of opacity values
     """
     num_layers, H, W = depth_ldi.shape
+    depth_ldi = np.clip(depth_ldi, 0, 200)
     f_pano = W / (2 * math.pi)
 
     u, v = np.meshgrid(np.arange(W), np.arange(H))
@@ -269,6 +270,7 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
     all_colors = []
     all_alphas = []
     all_depths = []
+    all_layer_ids = []
 
     for layer_idx in range(num_layers):
         rgba = rgba_ldi[layer_idx]
@@ -280,9 +282,10 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
         if valid.sum() == 0:
             continue
 
+        n_valid = valid.sum()
         d = depth[valid]
         rgb = rgba[..., :3][valid]
-        a = alpha[valid]
+        a = alpha[valid] * init_opacity
         t = theta[valid]
         v_valid = v[valid]
 
@@ -294,15 +297,19 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
         all_colors.append(rgb)
         all_alphas.append(a)
         all_depths.append(d)
+        # Reverse layer order to match load_panorama_ldi's [::-1] reversal
+        reversed_id = (num_layers - 1) - layer_idx
+        all_layer_ids.append(np.full(n_valid, reversed_id, dtype=np.int64))
 
     if len(all_points) == 0:
-        return None, None, None, None
+        return None, None, None, None, None
 
     return (
         torch.tensor(np.concatenate(all_points), dtype=torch.float32, device=device),
         torch.tensor(np.concatenate(all_colors), dtype=torch.float32, device=device),
         torch.tensor(np.concatenate(all_alphas), dtype=torch.float32, device=device),
         torch.tensor(np.concatenate(all_depths), dtype=torch.float32, device=device),
+        torch.tensor(np.concatenate(all_layer_ids), dtype=torch.int64, device=device),
     )
 
 
@@ -327,13 +334,9 @@ class GSParams:
         self.densify_grad_threshold = 0.0002
 
 
-def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None, device='cuda'):
-    """Initialize Gaussian parameters from point cloud.
-
-    When depths and pano_width are provided, each Gaussian is sized to cover
-    its pixel footprint with ~1.5x overlap, so the initial render is a blurry
-    but hole-free version of the scene.
-    """
+def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None,
+                         scale_mult=2.0, layer_ids=None, device='cuda'):
+    """Initialize Gaussian parameters from point cloud."""
     N = points.shape[0]
 
     means = nn.Parameter(points.clone())
@@ -341,7 +344,7 @@ def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None, d
 
     if depths is not None and pano_width is not None:
         f_pano = pano_width / (2 * math.pi)
-        per_point_scale = 2.0 * depths / f_pano
+        per_point_scale = scale_mult * depths / f_pano
         scales = nn.Parameter(torch.log(per_point_scale).unsqueeze(-1).expand(-1, 3).clone())
     else:
         init_scale = 0.02
@@ -353,8 +356,8 @@ def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None, d
     opacities = nn.Parameter(torch.logit(alphas.clamp(0.01, 0.99)))
     
     print(f'[INFO] Initialized {N:,} Gaussians')
-    
-    return {
+
+    gaussians = {
         'means': means,
         'scales': scales,
         'quats': quats,
@@ -365,6 +368,9 @@ def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None, d
         'denom': torch.zeros((N, 1), device=device),
         'max_radii2D': torch.zeros((N,), device=device),
     }
+    if layer_ids is not None:
+        gaussians['layer_ids'] = layer_ids
+    return gaussians
 
 
 def create_camera(theta, focal=582.69, H=512, W=512, device='cuda'):
@@ -390,17 +396,26 @@ def create_camera(theta, focal=582.69, H=512, W=512, device='cuda'):
     return {'w2c': w2c, 'K': K, 'H': H, 'W': W, 'theta': theta}
 
 
-def render_gaussians(gaussians, camera, background=None):
-    """Render Gaussians from a camera view."""
+def render_gaussians(gaussians, camera, background=None, max_layer=None):
+    """Render Gaussians from a camera view.
+
+    Args:
+        max_layer: If set, only render Gaussians from layers 0..max_layer.
+                   Requires gaussians['layer_ids'] to be present.
+    """
     if background is None:
         background = torch.ones(3, device=gaussians['means'].device)
-    
+
     means = gaussians['means']
     scales = torch.exp(gaussians['scales'])
     quats = F.normalize(gaussians['quats'], dim=-1)
     opacities = torch.sigmoid(gaussians['opacities'])
     colors = gaussians['colors']
-    
+
+    if max_layer is not None and 'layer_ids' in gaussians:
+        layer_mask = gaussians['layer_ids'] <= max_layer
+        opacities = opacities * layer_mask.float()
+
     render_colors, render_alphas, _ = rasterization(
         means=means,
         quats=quats,
@@ -415,11 +430,11 @@ def render_gaussians(gaussians, camera, background=None):
         render_mode="RGB+ED",
         backgrounds=background[None],
     )
-    
+
     rgb = render_colors[0, ..., :3]
     depth = render_colors[0, ..., 3]
     alpha = render_alphas[0, ..., 0]
-    
+
     return rgb, depth, alpha
 
 
@@ -520,7 +535,9 @@ def prune_gaussians(gaussians, mask_keep):
         'denom': gaussians['denom'][mask_keep].clone(),
         'max_radii2D': gaussians['max_radii2D'][mask_keep].clone(),
     }
-    
+    if 'layer_ids' in gaussians:
+        new_gaussians['layer_ids'] = gaussians['layer_ids'][mask_keep].clone()
+
     return new_gaussians
 
 
@@ -631,17 +648,14 @@ def compute_loss(rendered_rgb, target_rgb, rendered_depth, target_depth, mask=No
     return total_loss, l1_loss, ssim_loss, depth_loss
 
 
-def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interval=500):
+def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interval=500,
+          freeze_positions=False, depth_weight=0.005):
     """
-    Optimize Gaussians following paper approach:
-    - Random camera selection
-    - Per-layer loss with random layer
-    - Composite loss with all layers
-    - Both losses optimized simultaneously
-    - Densification and pruning following 3DGS
-    
+    Optimize Gaussians following paper approach.
+
     Args:
         video_interval: Render 360 video every N iterations (0 to disable)
+        freeze_positions: If True, don't optimize Gaussian positions (preserves 3D structure)
     """
     device = gaussians['means'].device
     num_layers = targets[0]['layer_images'].shape[0]
@@ -661,17 +675,16 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
     def build_optimizer(gaussians):
         """Build optimizer with per-parameter learning rates."""
         params = [
-            {'params': [gaussians['means']], 'lr': opt.position_lr_init, 'name': 'means'},
             {'params': [gaussians['scales']], 'lr': opt.scaling_lr, 'name': 'scales'},
             {'params': [gaussians['quats']], 'lr': opt.rotation_lr, 'name': 'quats'},
             {'params': [gaussians['opacities']], 'lr': opt.opacity_lr, 'name': 'opacities'},
             {'params': [gaussians['colors']], 'lr': opt.feature_lr, 'name': 'colors'},
         ]
+        if not freeze_positions:
+            params.insert(0, {'params': [gaussians['means']], 'lr': opt.position_lr_init, 'name': 'means'})
         return torch.optim.Adam(params, lr=0.0, eps=1e-15)
     
     optimizer = build_optimizer(gaussians)
-    
-    background = torch.ones(3, device=device)
     
     # Estimate scene extent for densification thresholds
     with torch.no_grad():
@@ -701,12 +714,15 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
     print(f'[INFO] Initial Gaussians: {gaussians["means"].shape[0]:,}')
     print(f'[INFO] Densification: iter {opt.densify_from_iter} to {opt.densify_until_iter}, interval {opt.densification_interval}')
     
+    if freeze_positions:
+        print(f'[INFO] Positions FROZEN — optimizing color/opacity/scale only')
+
     pbar = tqdm(range(1, num_iterations + 1), desc="Training")
     for iteration in pbar:
-        # Update learning rate for positions
-        for param_group in optimizer.param_groups:
-            if param_group['name'] == 'means':
-                param_group['lr'] = position_lr_fn(iteration)
+        if not freeze_positions:
+            for param_group in optimizer.param_groups:
+                if param_group['name'] == 'means':
+                    param_group['lr'] = position_lr_fn(iteration)
         
         # Random view selection
         view_idx = np.random.randint(len(targets))
@@ -717,16 +733,31 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
                                target['layer_images'].shape[1],
                                target['layer_images'].shape[2], device)
 
-        # Render
-        rendered_rgb, rendered_depth, alpha = render_gaussians(gaussians, camera, background)
+        # Random background color prevents Gaussians from learning to be transparent
+        background = torch.rand(3, device=device)
 
-        # Composite loss only — per-layer loss requires per-layer rendering
-        # (filtering Gaussians by layer) which is not yet implemented
-        loss, l1_comp, ssim_comp, depth_comp = compute_loss(
+        # === Per-layer loss: random layer, render only Gaussians up to that layer ===
+        random_layer = np.random.randint(num_layers)
+        layer_rgb, layer_depth, _ = render_gaussians(
+            gaussians, camera, background, max_layer=random_layer)
+        layer_mask = target['layer_masks'][random_layer]
+        loss_layer, _, _, _ = compute_loss(
+            layer_rgb, target['layer_images'][random_layer],
+            layer_depth, target['layer_depths'][random_layer],
+            mask=layer_mask, lambda_dssim=opt.lambda_dssim,
+            depth_weight=depth_weight
+        )
+
+        # === Composite loss: all Gaussians ===
+        rendered_rgb, rendered_depth, alpha = render_gaussians(gaussians, camera, background)
+        loss_comp, _, _, _ = compute_loss(
             rendered_rgb, target['composite_image'],
             rendered_depth, target['composite_depth'],
-            mask=None, lambda_dssim=opt.lambda_dssim
+            mask=None, lambda_dssim=opt.lambda_dssim,
+            depth_weight=depth_weight
         )
+
+        loss = loss_layer + loss_comp
         
         # Backward
         loss.backward()
@@ -868,6 +899,14 @@ def main():
                         help='Render 360 video every N iterations (0 to disable)')
     parser.add_argument('--init_only', action='store_true',
                         help='Save initialized Gaussians without training')
+    parser.add_argument('--scale_mult', type=float, default=2.0,
+                        help='Gaussian scale as multiple of pixel footprint')
+    parser.add_argument('--init_opacity', type=float, default=0.05,
+                        help='Initial opacity for all Gaussians')
+    parser.add_argument('--freeze_positions', action='store_true',
+                        help='Freeze Gaussian positions during training (appearance-only optimization)')
+    parser.add_argument('--depth_weight', type=float, default=0.005,
+                        help='Depth L2 loss weight')
 
     args = parser.parse_args()
     
@@ -893,15 +932,19 @@ def main():
     depth_raw = np.load(os.path.join(args.ldi_dir, 'depth_ldi.npy'))
 
     print('[INFO] Unprojecting panorama to point cloud...')
-    points, colors, alphas, depths = unproject_panorama_to_points(rgba_raw, depth_raw, device)
+    points, colors, alphas, depths, layer_ids = unproject_panorama_to_points(
+        rgba_raw, depth_raw, init_opacity=args.init_opacity, device=device)
 
     print(f'[INFO] Total points: {len(points):,}')
 
-    gaussians = initialize_gaussians(points, colors, alphas, depths, original_width, device)
+    gaussians = initialize_gaussians(
+        points, colors, alphas, depths, original_width,
+        scale_mult=args.scale_mult, layer_ids=layer_ids, device=device)
     
     if not args.init_only:
         debug_dir = os.path.join(os.path.dirname(args.output) or '.', 'debug') if args.debug else None
-        gaussians = train(gaussians, targets, args.num_iterations, debug_dir, args.video_interval)
+        gaussians = train(gaussians, targets, args.num_iterations, debug_dir, args.video_interval,
+                          freeze_positions=args.freeze_positions, depth_weight=args.depth_weight)
     
     # Save
     save_gaussians_ply(gaussians, args.output)

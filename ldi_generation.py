@@ -130,17 +130,6 @@ def generate_ldi(image, depth, num_layers=4, inpainter=None, save_dir=None, debu
         depth_layers = np.stack(depth_layers)
         mask_layers = np.stack(mask_layers)
     
-    # Fill back layer to 100% coverage so there's always a background surface
-    back = num_layers - 1
-    empty = rgba_layers[back, :, :, 3] < 0.1
-    if empty.any():
-        n_empty = empty.sum()
-        pct = n_empty / empty.size * 100
-        print(f'[INFO] Filling {n_empty:,} empty pixels ({pct:.1f}%) in back layer')
-        rgba_layers[back, empty, :3] = image[empty]
-        rgba_layers[back, empty, 3] = 1.0
-        depth_layers[back, empty] = depth_bins[-1]
-
     # Save outputs
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -153,17 +142,22 @@ def generate_ldi(image, depth, num_layers=4, inpainter=None, save_dir=None, debu
         print(f'[INFO] Saved: {save_dir}/depth_ldi.npy')
         print(f'[INFO] Saved: {save_dir}/mask_ldi.npy')
         
-        # Save visualizations
+        # Save panorama and per-layer visualizations
+        Image.fromarray((image * 255).astype(np.uint8)).save(f'{save_dir}/panorama.png')
+        disp = 1.0 / np.maximum(depth, 1e-6)
+        disp_vmin, disp_vmax = 1.0 / depth.max(), 1.0 / depth.min()
+        depth_vis = colorize(disp, vmin=disp_vmin, vmax=disp_vmax, cmap='turbo')
+        cv2.imwrite(f'{save_dir}/panorama_depth.png', depth_vis[..., :3][..., ::-1])
         for i in range(len(rgba_layers)):
             rgba_img = (rgba_layers[i] * 255).astype(np.uint8)
             Image.fromarray(rgba_img).save(f'{save_dir}/layer_{i:02d}_rgba.png')
-            
-            if debug:
-                depth_vis = colorize(depth_layers[i], cmap='turbo')
-                cv2.imwrite(f'{save_dir}/layer_{i:02d}_depth.png', depth_vis[..., :3][..., ::-1])
-                
-                mask_vis = (mask_layers[i] * 255).astype(np.uint8)
-                cv2.imwrite(f'{save_dir}/layer_{i:02d}_mask.png', mask_vis)
+
+            d = depth_layers[i].copy()
+            alpha = rgba_layers[i, :, :, 3]
+            disp_layer = np.where(alpha > 0.1, 1.0 / np.maximum(d, 1e-6), -99)
+            depth_vis = colorize(disp_layer, vmin=disp_vmin, vmax=disp_vmax, cmap='turbo',
+                                 invalid_val=-99, background_color=(0, 0, 0, 255))
+            cv2.imwrite(f'{save_dir}/layer_{i:02d}_depth.png', depth_vis[..., :3][..., ::-1])
     
     return rgba_layers, depth_layers, mask_layers
 

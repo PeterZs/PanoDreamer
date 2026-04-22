@@ -274,8 +274,8 @@ def main():
                         help='Number of frames')
     parser.add_argument('--fps', type=int, default=60,
                         help='Video frame rate')
-    parser.add_argument('--focal', type=float, default=2*582.69,
-                        help='Focal length')
+    parser.add_argument('--focal', type=float, default=622.61,
+                        help='Focal length (default matches training FOV=44.7deg at 512px)')
     parser.add_argument('--radius', type=float, default=2.0,
                         help='Camera orbit radius')
     parser.add_argument('--height', type=int, default=512,
