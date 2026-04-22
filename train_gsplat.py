@@ -28,6 +28,7 @@ import kornia
 from kornia.utils import create_meshgrid
 
 from gsplat import rasterization
+from utils.depth_utilsv2 import estimate_depth
 
 
 def fov2focal(fov_radians, pixels):
@@ -122,9 +123,9 @@ def load_panorama_ldi(ldi_dir):
     
     print(f'[INFO] Panorama LDI shape: {rgba_pano.shape}, depth: {depth_pano.shape}, layers: {num_layers}')
     
-    # Duplicate horizontally for seamless 360 wrapping (and flip as in reference)
-    rgba_pano = np.concatenate([rgba_pano, rgba_pano], axis=2)[::-1].copy()
-    depth_pano = np.concatenate([depth_pano, depth_pano], axis=2)[::-1].copy()
+    # Triple horizontally so any 512-wide crop centered in the middle copy is valid
+    rgba_pano = np.concatenate([rgba_pano, rgba_pano, rgba_pano], axis=2)[::-1].copy()
+    depth_pano = np.concatenate([depth_pano, depth_pano, depth_pano], axis=2)[::-1].copy()
     
     return rgba_pano, depth_pano, original_width, num_layers
 
@@ -140,26 +141,18 @@ def extract_perspective_views(rgba_pano, depth_pano, original_width, num_views=2
     """
     num_layers, h, w = rgba_pano.shape[:3]
     focal = fov2focal(fov_deg * math.pi / 180, view_size)
-    
-    # Step size for panorama sampling
-    step = original_width // num_views
-    
+
     views = []
-    
+
     print(f'[INFO] Extracting {num_views} perspective views from panorama...')
     for view_idx in tqdm(range(num_views), desc="Extracting views"):
         # Rotation angle for this view
         theta = view_idx * (2 * np.pi) / num_views
-        
-        # Crop window from panorama
-        center = w // 2 + step * view_idx
+
+        # Crop center in the middle copy of the tripled panorama
+        center = int(round(original_width + theta * original_width / (2 * math.pi)))
         start = center - view_size // 2
         end = center + view_size // 2
-        
-        # Handle wrap-around
-        if end > w:
-            start = w - view_size
-            end = w
         
         crop_rgba = rgba_pano[:, :, start:end]  # [num_layers, H, W, 4]
         crop_depth = depth_pano[:, :, start:end]  # [num_layers, H, W]
@@ -396,12 +389,52 @@ def create_camera(theta, focal=582.69, H=512, W=512, device='cuda'):
     return {'w2c': w2c, 'K': K, 'H': H, 'W': W, 'theta': theta}
 
 
+def create_orbit_camera(theta, radius=3.0, focal=582.69, H=512, W=512, device='cuda'):
+    """Create orbit camera: positioned at radius from origin, looking inward."""
+    eye = np.array([radius * np.cos(theta), 0, radius * np.sin(theta)])
+    up = np.array([0, 1, 0])
+    forward = -eye / np.linalg.norm(eye)
+    right = np.cross(up, forward)
+    right /= np.linalg.norm(right)
+    up = np.cross(forward, right)
+
+    c2w = np.eye(4)
+    c2w[:3, 0] = right
+    c2w[:3, 1] = up
+    c2w[:3, 2] = forward
+    c2w[:3, 3] = eye
+
+    w2c = torch.tensor(np.linalg.inv(c2w), dtype=torch.float32, device=device)
+    K = torch.tensor([
+        [focal, 0, W / 2],
+        [0, focal, H / 2],
+        [0, 0, 1]
+    ], dtype=torch.float32, device=device)
+
+    return {'w2c': w2c, 'K': K, 'H': H, 'W': W, 'theta': theta}
+
+
+def pearson_depth_loss(rendered_depth, mono_depth):
+    """Pearson correlation loss between rendered and monocular depth (Zhu et al. 2024)."""
+    rd = rendered_depth.reshape(-1, 1)
+    md = mono_depth.reshape(-1, 1)
+    valid = (rd > 0).squeeze() & (md > 0).squeeze()
+    if valid.sum() < 10:
+        return torch.tensor(0.0, device=rendered_depth.device)
+    rd = rd[valid]
+    md = md[valid]
+    vx = rd - rd.mean()
+    vy = md - md.mean()
+    corr = (vx * vy).sum() / (torch.sqrt((vx ** 2).sum() * (vy ** 2).sum()) + 1e-8)
+    return 1.0 - corr
+
+
 def render_gaussians(gaussians, camera, background=None, max_layer=None):
     """Render Gaussians from a camera view.
 
     Args:
-        max_layer: If set, only render Gaussians from layers 0..max_layer.
-                   Requires gaussians['layer_ids'] to be present.
+        max_layer: If set, physically select only Gaussians from layers 0..max_layer
+                   and pass that subset to the rasterizer (no opacity zeroing).
     """
     if background is None:
         background = torch.ones(3, device=gaussians['means'].device)
@@ -413,10 +446,14 @@ def render_gaussians(gaussians, camera, background=None, max_layer=None):
     colors = gaussians['colors']
 
     if max_layer is not None and 'layer_ids' in gaussians:
-        layer_mask = gaussians['layer_ids'] <= max_layer
-        opacities = opacities * layer_mask.float()
+        mask = gaussians['layer_ids'] <= max_layer
+        means = means[mask]
+        scales = scales[mask]
+        quats = quats[mask]
+        opacities = opacities[mask]
+        colors = colors[mask]
 
-    render_colors, render_alphas, _ = rasterization(
+    render_colors, render_alphas, info = rasterization(
         means=means,
         quats=quats,
         scales=scales,
@@ -429,6 +466,8 @@ def render_gaussians(gaussians, camera, background=None, max_layer=None):
         packed=False,
         render_mode="RGB+ED",
         backgrounds=background[None],
+        rasterize_mode="antialiased",
+        absgrad=True,
     )
 
     rgb = render_colors[0, ..., :3]
@@ -649,13 +688,17 @@ def compute_loss(rendered_rgb, target_rgb, rendered_depth, target_depth, mask=No
 
 
 def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interval=500,
-          freeze_positions=False, depth_weight=0.005):
+          freeze_positions=False, depth_weight=0.005,
+          novel_view_weight=0.0, novel_view_radius=3.0, novel_view_start=100):
     """
     Optimize Gaussians following paper approach.
 
     Args:
         video_interval: Render 360 video every N iterations (0 to disable)
         freeze_positions: If True, don't optimize Gaussian positions (preserves 3D structure)
+        novel_view_weight: Weight for novel view depth loss (Zhu et al. 2024). 0 to disable.
+        novel_view_radius: Orbit radius for novel view cameras
+        novel_view_start: Iteration to start novel view depth loss
     """
     device = gaussians['means'].device
     num_layers = targets[0]['layer_images'].shape[0]
@@ -716,6 +759,8 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
     
     if freeze_positions:
         print(f'[INFO] Positions FROZEN — optimizing color/opacity/scale only')
+    if novel_view_weight > 0:
+        print(f'[INFO] Novel view depth loss: weight={novel_view_weight}, radius={novel_view_radius}, start iter={novel_view_start}')
 
     pbar = tqdm(range(1, num_iterations + 1), desc="Training")
     for iteration in pbar:
@@ -758,7 +803,21 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
         )
 
         loss = loss_layer + loss_comp
-        
+
+        # === Novel view depth loss (Zhu et al. 2024) ===
+        if novel_view_weight > 0 and iteration >= novel_view_start:
+            nv_theta = np.random.uniform(0, 2 * np.pi)
+            nv_camera = create_orbit_camera(
+                nv_theta, radius=novel_view_radius,
+                focal=target['focal'], H=target['layer_images'].shape[1],
+                W=target['layer_images'].shape[2], device=device)
+            nv_rgb, nv_depth, nv_alpha = render_gaussians(gaussians, nv_camera, background)
+            nv_rgb_np = (nv_rgb.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+            mono = estimate_depth(nv_rgb_np)
+            mono_t = torch.tensor(mono, dtype=torch.float32, device=device)
+            nv_loss = pearson_depth_loss(nv_depth, mono_t)
+            loss = loss + novel_view_weight * nv_loss
+
         # Backward
         loss.backward()
         
@@ -821,9 +880,18 @@ def train(gaussians, targets, num_iterations=3000, debug_dir=None, video_interva
                         os.path.join(debug_dir, 'final_360.mp4'),
                         num_frames=60, fps=30, device=device)
     
+    # Post-training pruning: remove near-transparent Gaussians
+    with torch.no_grad():
+        opacities = torch.sigmoid(gaussians['opacities'])
+        keep = opacities > 0.01
+        n_before = gaussians['means'].shape[0]
+        gaussians = prune_gaussians(gaussians, keep)
+        n_after = gaussians['means'].shape[0]
+        print(f'[INFO] Post-training prune: {n_before:,} → {n_after:,} ({n_before - n_after:,} removed, opacity < 0.01)')
+
     print(f'[INFO] Optimization complete')
     print(f'[INFO] Final Gaussians: {gaussians["means"].shape[0]:,}')
-    
+
     return gaussians
 
 
@@ -907,6 +975,12 @@ def main():
                         help='Freeze Gaussian positions during training (appearance-only optimization)')
     parser.add_argument('--depth_weight', type=float, default=0.005,
                         help='Depth L2 loss weight')
+    parser.add_argument('--novel_view_weight', type=float, default=0.0,
+                        help='Novel view depth loss weight (0 to disable)')
+    parser.add_argument('--novel_view_radius', type=float, default=3.0,
+                        help='Orbit radius for novel view cameras')
+    parser.add_argument('--novel_view_start', type=int, default=100,
+                        help='Iteration to start novel view depth loss')
 
     args = parser.parse_args()
     
@@ -944,7 +1018,10 @@ def main():
     if not args.init_only:
         debug_dir = os.path.join(os.path.dirname(args.output) or '.', 'debug') if args.debug else None
         gaussians = train(gaussians, targets, args.num_iterations, debug_dir, args.video_interval,
-                          freeze_positions=args.freeze_positions, depth_weight=args.depth_weight)
+                          freeze_positions=args.freeze_positions, depth_weight=args.depth_weight,
+                          novel_view_weight=args.novel_view_weight,
+                          novel_view_radius=args.novel_view_radius,
+                          novel_view_start=args.novel_view_start)
     
     # Save
     save_gaussians_ply(gaussians, args.output)

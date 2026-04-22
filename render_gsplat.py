@@ -72,17 +72,18 @@ def normalize(x):
     return x / np.linalg.norm(x, axis=-1, keepdims=True)
 
 
-def create_camera_path(num_frames=120, radius=4.0, center=None, panorama_mode=False):
+def create_camera_path(num_frames=120, radius=4.0, center=None, panorama_mode=False, camera_y=None):
     """
     Create circular camera path.
-    
+
     Args:
         num_frames: Number of camera positions
         radius: Distance from scene center (only used if panorama_mode=False)
         center: [3] scene center (default: origin)
         panorama_mode: If True, camera at origin looking outward (for panorama scenes).
                        If False, camera orbits around center looking inward.
-    
+        camera_y: Override Y height for orbit camera. None = use center Y.
+
     Returns:
         poses: [num_frames, 4, 4] camera-to-world matrices
     """
@@ -110,8 +111,9 @@ def create_camera_path(num_frames=120, radius=4.0, center=None, panorama_mode=Fa
         else:
             # Camera orbits around scene center, looking inward
             up = np.array([0, 1, 0])
-            eye = center + np.array([radius * np.cos(theta), 0, radius * np.sin(theta)])
-            lookat = center
+            eye_y = camera_y if camera_y is not None else center[1]
+            eye = np.array([center[0] + radius * np.cos(theta), eye_y, center[2] + radius * np.sin(theta)])
+            lookat = np.array([center[0], eye_y, center[2]])
             
             w = normalize(lookat - eye)  # forward
             u = normalize(np.cross(up, w))  # right
@@ -175,6 +177,7 @@ def render_frame(gaussians, c2w, H=512, W=512, focal=582.69, device='cuda'):
         height=H,
         packed=False,
         render_mode="RGB+ED",
+        rasterize_mode="antialiased",
     )
     
     # Extract RGB (first 3 channels) and depth (4th channel)
@@ -187,10 +190,10 @@ def render_frame(gaussians, c2w, H=512, W=512, focal=582.69, device='cuda'):
 
 @torch.no_grad()
 def render_video(gaussians, output_dir, num_frames=120, fps=60, radius=4.0,
-                 H=512, W=512, focal=582.69, panorama_mode=False):
+                 H=512, W=512, focal=582.69, panorama_mode=False, camera_y=None):
     """
     Render RGB, depth, and alpha videos.
-    
+
     Args:
         gaussians: Dictionary of Gaussian parameters
         output_dir: Output directory
@@ -200,19 +203,21 @@ def render_video(gaussians, output_dir, num_frames=120, fps=60, radius=4.0,
         H, W: Image dimensions
         focal: Focal length
         panorama_mode: If True, camera at origin looking outward (for panorama scenes)
+        camera_y: Override Y height for orbit camera. None = scene center Y.
     """
-    # Compute scene center from Gaussian positions
     means = gaussians['means']
     scene_center = means.mean(dim=0).cpu().numpy()
-    
+
     print(f'[INFO] Rendering {num_frames} frames at {fps} fps')
     if panorama_mode:
         print(f'[INFO] Panorama mode: camera at origin, rotating to look outward')
     else:
+        eye_y = camera_y if camera_y is not None else scene_center[1]
         print(f'[INFO] Scene center: [{scene_center[0]:.2f}, {scene_center[1]:.2f}, {scene_center[2]:.2f}]')
-        print(f'[INFO] Camera orbit radius: {radius}')
-    
-    poses = create_camera_path(num_frames, radius, center=scene_center, panorama_mode=panorama_mode)
+        print(f'[INFO] Camera orbit radius: {radius}, camera Y: {eye_y:.2f}')
+
+    poses = create_camera_path(num_frames, radius, center=scene_center,
+                               panorama_mode=panorama_mode, camera_y=camera_y)
     
     os.makedirs(output_dir, exist_ok=True)
     frames_dir = os.path.join(output_dir, 'frames')
@@ -284,6 +289,8 @@ def main():
                         help='Image width')
     parser.add_argument('--panorama', action='store_true',
                         help='Use panorama camera mode (camera at origin, looking outward)')
+    parser.add_argument('--camera_y', type=float, default=None,
+                        help='Override camera Y height for orbit mode (default: scene center Y)')
     
     args = parser.parse_args()
     
@@ -298,7 +305,8 @@ def main():
         H=args.height,
         W=args.width,
         focal=args.focal,
-        panorama_mode=args.panorama
+        panorama_mode=args.panorama,
+        camera_y=args.camera_y
     )
     
     print('[INFO] Done!')
