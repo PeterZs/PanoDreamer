@@ -268,6 +268,7 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
     all_points = []
     all_colors = []
     all_alphas = []
+    all_depths = []
 
     for layer_idx in range(num_layers):
         rgba = rgba_ldi[layer_idx]
@@ -292,14 +293,16 @@ def unproject_panorama_to_points(rgba_ldi, depth_ldi, device='cuda'):
         all_points.append(np.stack([X, Y, Z], axis=-1))
         all_colors.append(rgb)
         all_alphas.append(a)
+        all_depths.append(d)
 
     if len(all_points) == 0:
-        return None, None, None
+        return None, None, None, None
 
     return (
         torch.tensor(np.concatenate(all_points), dtype=torch.float32, device=device),
         torch.tensor(np.concatenate(all_colors), dtype=torch.float32, device=device),
         torch.tensor(np.concatenate(all_alphas), dtype=torch.float32, device=device),
+        torch.tensor(np.concatenate(all_depths), dtype=torch.float32, device=device),
     )
 
 
@@ -324,15 +327,25 @@ class GSParams:
         self.densify_grad_threshold = 0.0002
 
 
-def initialize_gaussians(points, colors, alphas, device='cuda'):
-    """Initialize Gaussian parameters from point cloud."""
+def initialize_gaussians(points, colors, alphas, depths=None, pano_width=None, device='cuda'):
+    """Initialize Gaussian parameters from point cloud.
+
+    When depths and pano_width are provided, each Gaussian is sized to cover
+    its pixel footprint with ~1.5x overlap, so the initial render is a blurry
+    but hole-free version of the scene.
+    """
     N = points.shape[0]
-    
+
     means = nn.Parameter(points.clone())
     colors_param = nn.Parameter(colors.clone())
-    
-    init_scale = 0.02
-    scales = nn.Parameter(torch.full((N, 3), math.log(init_scale), device=device))
+
+    if depths is not None and pano_width is not None:
+        f_pano = pano_width / (2 * math.pi)
+        per_point_scale = 2.0 * depths / f_pano
+        scales = nn.Parameter(torch.log(per_point_scale).unsqueeze(-1).expand(-1, 3).clone())
+    else:
+        init_scale = 0.02
+        scales = nn.Parameter(torch.full((N, 3), math.log(init_scale), device=device))
     
     quats = nn.Parameter(torch.zeros((N, 4), device=device))
     quats.data[:, 0] = 1.0
@@ -853,7 +866,9 @@ def main():
                         help='Save debug images and videos')
     parser.add_argument('--video_interval', type=int, default=1000,
                         help='Render 360 video every N iterations (0 to disable)')
-    
+    parser.add_argument('--init_only', action='store_true',
+                        help='Save initialized Gaussians without training')
+
     args = parser.parse_args()
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -878,18 +893,15 @@ def main():
     depth_raw = np.load(os.path.join(args.ldi_dir, 'depth_ldi.npy'))
 
     print('[INFO] Unprojecting panorama to point cloud...')
-    points, colors, alphas = unproject_panorama_to_points(rgba_raw, depth_raw, device)
+    points, colors, alphas, depths = unproject_panorama_to_points(rgba_raw, depth_raw, device)
 
     print(f'[INFO] Total points: {len(points):,}')
+
+    gaussians = initialize_gaussians(points, colors, alphas, depths, original_width, device)
     
-    # Initialize Gaussians (per-pixel, no subsampling - let densification/pruning optimize)
-    gaussians = initialize_gaussians(points, colors, alphas, device)
-    
-    # Debug directory
-    debug_dir = os.path.join(os.path.dirname(args.output) or '.', 'debug') if args.debug else None
-    
-    # Train with densification and pruning
-    gaussians = train(gaussians, targets, args.num_iterations, debug_dir, args.video_interval)
+    if not args.init_only:
+        debug_dir = os.path.join(os.path.dirname(args.output) or '.', 'debug') if args.debug else None
+        gaussians = train(gaussians, targets, args.num_iterations, debug_dir, args.video_interval)
     
     # Save
     save_gaussians_ply(gaussians, args.output)

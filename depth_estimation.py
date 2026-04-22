@@ -27,7 +27,7 @@ from tqdm import tqdm
 import matplotlib.cm as cm
 
 from ropwr import RobustPWRegression
-from utils.depth_utilsv2 import estimate_depth
+from utils.depth_utilsv2 import estimate_depth, estimate_metric_depth, calibrate_relative_depth
 from utils.depth_layering import get_depth_bins
 from utils.depth import colorize
 
@@ -136,30 +136,18 @@ def get_masks(depth, num_bins=5):
     return masks, bins
 
 
-def process_depth(depth):
-    """
-    Process raw depth to metric-like depth.
-    
-    Args:
-        depth: Raw monocular depth output
-        
-    Returns:
-        Processed depth values
-    """
-    depth = 2 * abs(depth.min() + 1e-1) + depth
-    depth = 3 + 1 / (depth / 255. + 1e-1)
-    return depth
 
-
-def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10, debug=False):
+def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10,
+                        metric_dataset='vkitti', debug=False):
     """
     Estimate depth for a wide perspective image (no cylindrical projection).
-    
+
     Args:
         image: Wide image as numpy array [H, W, 3]
         save_dir: Directory to save outputs
         num_iterations: Number of alignment iterations
         num_bins: Number of depth bins for piecewise regression
+        metric_dataset: 'vkitti' (outdoor, 80m) or 'hypersim' (indoor, 20m)
         debug: Save debug info
         
     Returns:
@@ -194,13 +182,19 @@ def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10, debug=F
         image_curr = image[:, view_start:view_start + view_size]
         image_pil = Image.fromarray(image_curr)
         
-        # Estimate depth
+        # Estimate depth (DA V2 outputs disparity-like: larger = closer)
+        # Align in disparity space (uniform distribution, good for regression)
         monodepth = estimate_depth(image_pil)
-        depth_curr = process_depth(monodepth)
-        
-        # Get depth bins for alignment
-        _, bins = get_masks(torch.tensor(depth_curr)[None, None], num_bins=num_bins)
-        
+        depth_curr = monodepth.astype(np.float32)
+
+        # Percentile bins for piecewise regression in disparity space
+        vals = depth_curr.flatten()
+        vals_pos = vals[vals > 0]
+        bin_edges = np.percentile(vals_pos, np.linspace(0, 100, num_bins + 1))
+        bins = sorted(set(bin_edges.tolist()))
+        bins[0] -= 1e-6
+        bins[-1] += 1e-6
+
         depth_arr.append(depth_curr)
         bins_arr.append(bins)
     
@@ -232,13 +226,11 @@ def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10, debug=F
         mask_full = np.maximum(mask_full, 1e-6)  # Avoid divide by zero
         depth_full = depth_full / mask_full
         
-        # Store min/max from first iteration for consistent scaling
+        # Save iteration result (invert disparity for depth visualization)
+        depth_viz = 1.0 / np.maximum(depth_full, 0.01)
         if iteration == 0:
-            depth_max = depth_full.max()
-            depth_min = depth_full.min()
-        
-        # Save iteration result
-        depth_normalized = (depth_full - depth_min) / (depth_max - depth_min + 1e-6)
+            viz_min, viz_max = depth_viz.min(), depth_viz.max()
+        depth_normalized = (depth_viz - viz_min) / (viz_max - viz_min + 1e-6)
         depth_colored = colorize(depth_normalized, cmap='turbo')
         cv2.imwrite(f"{save_dir}/depth_iter_{iteration:02d}.png", depth_colored[..., :3][..., ::-1])
         
@@ -263,21 +255,37 @@ def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10, debug=F
                     print(f"[WARNING] Alignment failed for view {view_i}: {e}")
                 continue
     
+    # Invert disparity to depth, then calibrate to metric
+    depth_full = 1.0 / np.maximum(depth_full, 0.01)
+
+    ref_idx = num_views // 2
+    ref_start = view_starts[ref_idx]
+    ref_image = image[:, ref_start:ref_start + view_size]
+    ref_pil = Image.fromarray(ref_image)
+    metric_ref = estimate_metric_depth(ref_pil, dataset=metric_dataset)
+    ref_depth = depth_full[:, ref_start:ref_start + view_size]
+    scale, bias = calibrate_relative_depth(ref_depth, metric_ref)
+    depth_full = scale * depth_full + bias
+    depth_full = np.maximum(depth_full, 0.1)
+    print(f'[INFO] Calibrated depth range: [{depth_full.min():.2f}m, {depth_full.max():.2f}m]')
+
     # Save final outputs
     np.save(f"{save_dir}/depth.npy", depth_full)
-    
+
+    depth_normalized = (depth_full - depth_full.min()) / (depth_full.max() - depth_full.min() + 1e-6)
     depth_colored = colorize(depth_normalized, cmap='turbo')
     cv2.imwrite(f"{save_dir}/depth.png", depth_colored[..., :3][..., ::-1])
-    
+
     print(f'[INFO] Depth estimation complete!')
     print(f'[INFO] Saved: {save_dir}/depth.npy')
     print(f'[INFO] Saved: {save_dir}/depth.png')
-    
+
     return depth_full
 
 
-def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10, 
-                            input_fov=44.701948991275390, mul_factor=12, debug=False):
+def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10,
+                            input_fov=44.701948991275390, mul_factor=12,
+                            metric_dataset='vkitti', debug=False):
     """
     Estimate depth for a cylindrical panorama (360°).
     
@@ -288,6 +296,7 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
         num_bins: Number of depth bins for piecewise regression
         input_fov: Field of view in degrees
         mul_factor: View sampling factor
+        metric_dataset: 'vkitti' (outdoor, 80m) or 'hypersim' (indoor, 20m)
         debug: Save debug info
         
     Returns:
@@ -330,21 +339,25 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
         image_proj = cyl_proj(image_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
         image_proj = Image.fromarray((image_proj * 255).astype(np.uint8))
         
-        # Estimate depth
+        # Estimate depth (DA V2 outputs disparity-like: larger = closer)
+        # Align in disparity space (uniform distribution, good for regression)
         monodepth = estimate_depth(image_proj)
-        depth_curr = process_depth(monodepth)
-        
-        # Get depth bins for alignment
-        masks, bins = get_masks(torch.tensor(depth_curr)[None, None], num_bins=num_bins)
-        
+        depth_curr = monodepth.astype(np.float32)
+
+        # Percentile bins for piecewise regression in disparity space
+        vals = depth_curr.flatten()
+        vals_pos = vals[vals > 0]
+        bin_edges = np.percentile(vals_pos, np.linspace(0, 100, num_bins + 1))
+        bins = sorted(set(bin_edges.tolist()))
+        bins[0] -= 1e-6
+        bins[-1] += 1e-6
+
         depth_arr.append(depth_curr)
-        mask_arr.append(masks)
         bins_arr.append(bins)
     
     if debug:
         np.save(f"{save_dir}/depth_info.npy", {
-            'depth_arr': depth_arr, 
-            'mask_arr': mask_arr, 
+            'depth_arr': depth_arr,
             'bins_arr': bins_arr
         })
     
@@ -385,9 +398,12 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
             depth_max = depth_pano.max()
             depth_min = depth_pano.min()
         
-        # Save iteration result
-        depth_save = np.maximum(depth_pano[:, :w], 3)
-        depth_normalized = (depth_save - 3) / (depth_max - 3)
+        # Save iteration result (invert disparity for depth visualization)
+        disp_save = depth_pano[:, :w]
+        depth_viz = 1.0 / np.maximum(disp_save, 0.01)
+        if iteration == 0:
+            viz_min, viz_max = depth_viz.min(), depth_viz.max()
+        depth_normalized = (depth_viz - viz_min) / (viz_max - viz_min + 1e-6)
         depth_colored = colorize(depth_normalized, cmap='turbo')
         cv2.imwrite(f"{save_dir}/depth_iter_{iteration:02d}.png", depth_colored[..., :3][..., ::-1])
         
@@ -414,19 +430,40 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
                     print(f"[WARNING] Alignment failed for view {view_i}: {e}")
                 continue
     
-    # Extract final half panorama (no duplication)
-    depth_pano_half = depth_pano[:, :w]
-    
+    # Extract final half panorama (disparity space) and invert to depth
+    disp_pano_half = depth_pano[:, :w]
+    depth_pano_half = 1.0 / np.maximum(disp_pano_half, 0.01)
+
+    # Calibrate to metric depth using a reference view
+    ref_start = w // 2 - 256
+    ref_image = image_pano_tiled[:, ref_start:ref_start + 512]
+    ref_tensor = torch.tensor(ref_image).permute(2, 0, 1)[None].to(device).float() / 255.
+    ref_persp_np = cyl_proj(ref_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
+    ref_persp_pil = Image.fromarray((ref_persp_np * 255).astype(np.uint8))
+
+    metric_ref = estimate_metric_depth(ref_persp_pil, dataset=metric_dataset)
+
+    ref_disp_cyl = disp_pano_half[:, ref_start:ref_start + 512]
+    ref_disp_tensor = torch.tensor(ref_disp_cyl).float()[None, None].to(device)
+    ref_disp_persp = cyl_proj(ref_disp_tensor, input_focal).cpu().numpy()[0, 0]
+    ref_depth_persp = 1.0 / np.maximum(ref_disp_persp, 0.01)
+
+    scale, bias = calibrate_relative_depth(ref_depth_persp, metric_ref)
+    depth_pano_half = scale * depth_pano_half + bias
+    depth_pano_half = np.maximum(depth_pano_half, 0.1)
+    print(f'[INFO] Calibrated depth range: [{depth_pano_half.min():.2f}m, {depth_pano_half.max():.2f}m]')
+
     # Save final outputs
     np.save(f"{save_dir}/depth_pano.npy", depth_pano_half)
-    
-    depth_colored = colorize(depth_pano_half, cmap='turbo')
+
+    depth_normalized = (depth_pano_half - depth_pano_half.min()) / (depth_pano_half.max() - depth_pano_half.min() + 1e-6)
+    depth_colored = colorize(depth_normalized, cmap='turbo')
     cv2.imwrite(f"{save_dir}/depth_pano.png", depth_colored[..., :3][..., ::-1])
-    
+
     print(f'[INFO] Depth estimation complete!')
     print(f'[INFO] Saved: {save_dir}/depth_pano.npy')
     print(f'[INFO] Saved: {save_dir}/depth_pano.png')
-    
+
     return depth_pano_half
 
 
@@ -446,9 +483,12 @@ def main():
                         help='Number of depth bins for alignment')
     parser.add_argument('--fov', type=float, default=44.701948991275390,
                         help='Field of view in degrees (panorama mode only)')
+    parser.add_argument('--metric_dataset', type=str, default='vkitti',
+                        choices=['vkitti', 'hypersim'],
+                        help='Metric depth model: vkitti (outdoor, 80m) or hypersim (indoor, 20m)')
     parser.add_argument('--debug', action='store_true',
                         help='Save debug info (large files)')
-    
+
     args = parser.parse_args()
     
     # Load image
@@ -465,6 +505,7 @@ def main():
             save_dir=args.output_dir,
             num_iterations=args.iterations,
             num_bins=args.num_bins,
+            metric_dataset=args.metric_dataset,
             debug=args.debug
         )
     else:  # panorama
@@ -474,6 +515,7 @@ def main():
             num_iterations=args.iterations,
             num_bins=args.num_bins,
             input_fov=args.fov,
+            metric_dataset=args.metric_dataset,
             debug=args.debug
         )
     

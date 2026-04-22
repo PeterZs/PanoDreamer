@@ -24,16 +24,18 @@ MODEL_CONFIGS = {
     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
 }
 
-# Lazy loading - model initialized on first use
+_CKPT_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), 'checkpoints')
+
 _model = None
+_metric_model = None
 _encoder = 'vitl'
 
 
 def _get_model():
-    """Load model on first use."""
+    """Load relative depth model on first use."""
     global _model
     if _model is None:
-        checkpoint_path = os.path.join(os.path.dirname(_SCRIPT_DIR), 'checkpoints', f'depth_anything_v2_{_encoder}.pth')
+        checkpoint_path = os.path.join(_CKPT_DIR, f'depth_anything_v2_{_encoder}.pth')
         print(f'[INFO] Loading Depth Anything V2 ({_encoder}) from {checkpoint_path}')
         _model = DepthAnythingV2(**MODEL_CONFIGS[_encoder])
         _model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
@@ -41,21 +43,105 @@ def _get_model():
     return _model
 
 
+class _MetricDepthAnythingV2(DepthAnythingV2):
+    """Metric variant: Sigmoid head (not ReLU), forward scales by max_depth."""
+
+    def __init__(self, max_depth=20.0, **kwargs):
+        super().__init__(**kwargs)
+        self.max_depth = max_depth
+        head_seq = self.depth_head.scratch.output_conv2
+        self.depth_head.scratch.output_conv2 = torch.nn.Sequential(
+            head_seq[0], head_seq[1], head_seq[2],
+            torch.nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        features = self.pretrained.get_intermediate_layers(
+            x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
+        depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
+        return depth.squeeze(1)
+
+
+def _get_metric_model(dataset='vkitti'):
+    """Load metric depth model on first use. dataset: 'vkitti' (outdoor, 80m) or 'hypersim' (indoor, 20m)."""
+    global _metric_model
+
+    max_depth = {'vkitti': 80.0, 'hypersim': 20.0}[dataset]
+    checkpoint_path = os.path.join(_CKPT_DIR, f'depth_anything_v2_metric_{dataset}_{_encoder}.pth')
+
+    if _metric_model is None or getattr(_metric_model, '_dataset', None) != dataset:
+        print(f'[INFO] Loading Depth Anything V2 metric ({dataset}, max_depth={max_depth}) from {checkpoint_path}')
+        model = _MetricDepthAnythingV2(max_depth=max_depth, **MODEL_CONFIGS[_encoder])
+        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        model = model.to(DEVICE).eval()
+        model._dataset = dataset
+        _metric_model = model
+    return _metric_model
+
+
 def estimate_depth(img, mode='test'):
     """
-    Estimate depth from an image.
-    
+    Estimate relative depth from an image.
+
     Args:
         img: PIL Image or numpy array (RGB)
         mode: Unused, kept for compatibility
-        
+
     Returns:
-        depth: HxW numpy array of depth values
+        depth: HxW numpy array of relative depth values (larger = farther)
     """
     model = _get_model()
     img = np.asarray(img)[:, :, [2, 1, 0]]  # RGB to BGR
 
     with torch.no_grad():
-        depth = model.infer_image(img)  # HxW raw depth map in numpy
+        depth = model.infer_image(img)
 
     return depth
+
+
+def estimate_metric_depth(img, dataset='vkitti'):
+    """
+    Estimate metric depth from an image.
+
+    Args:
+        img: PIL Image or numpy array (RGB)
+        dataset: 'vkitti' (outdoor, max 80m) or 'hypersim' (indoor, max 20m)
+
+    Returns:
+        depth: HxW numpy array of metric depth in meters (larger = farther)
+    """
+    model = _get_metric_model(dataset)
+    img = np.asarray(img)[:, :, [2, 1, 0]]
+
+    with torch.no_grad():
+        depth = model.infer_image(img)
+
+    return depth
+
+
+def calibrate_relative_depth(relative, metric, percentile=2):
+    """
+    Compute scale and bias to map relative depth to metric depth.
+    Uses near-far alignment with percentile-based robustness.
+
+    Args:
+        relative: HxW relative depth (from estimate_depth)
+        metric: HxW metric depth (from estimate_metric_depth), same image
+        percentile: percentile for near/far bounds (default 2 = 2nd/98th)
+
+    Returns:
+        scale, bias: such that calibrated = scale * relative + bias
+    """
+    rel_near = np.percentile(relative, percentile)
+    rel_far = np.percentile(relative, 100 - percentile)
+    met_near = np.percentile(metric, percentile)
+    met_far = np.percentile(metric, 100 - percentile)
+
+    scale = (met_far - met_near) / (rel_far - rel_near + 1e-8)
+    bias = met_near - scale * rel_near
+
+    print(f'[INFO] Depth calibration: scale={scale:.4f}, bias={bias:.4f}')
+    print(f'[INFO]   relative range: [{rel_near:.2f}, {rel_far:.2f}] -> metric range: [{met_near:.2f}m, {met_far:.2f}m]')
+
+    return scale, bias

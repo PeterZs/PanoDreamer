@@ -130,10 +130,21 @@ def generate_ldi(image, depth, num_layers=4, inpainter=None, save_dir=None, debu
         depth_layers = np.stack(depth_layers)
         mask_layers = np.stack(mask_layers)
     
+    # Fill back layer to 100% coverage so there's always a background surface
+    back = num_layers - 1
+    empty = rgba_layers[back, :, :, 3] < 0.1
+    if empty.any():
+        n_empty = empty.sum()
+        pct = n_empty / empty.size * 100
+        print(f'[INFO] Filling {n_empty:,} empty pixels ({pct:.1f}%) in back layer')
+        rgba_layers[back, empty, :3] = image[empty]
+        rgba_layers[back, empty, 3] = 1.0
+        depth_layers[back, empty] = depth_bins[-1]
+
     # Save outputs
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-        
+
         np.save(f'{save_dir}/rgba_ldi.npy', rgba_layers)
         np.save(f'{save_dir}/depth_ldi.npy', depth_layers)
         np.save(f'{save_dir}/mask_ldi.npy', mask_layers)

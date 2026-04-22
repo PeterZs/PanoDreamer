@@ -26,8 +26,7 @@ def get_depth_bins(depth=None, disparity=None, num_bins=None):
 
     assert (disparity is not None) or (depth is not None)
     if disparity is None:
-        assert depth.min() > 1e-2
-        disparity = 1. / depth
+        disparity = 1. / torch.clamp(depth, min=1e-6)
 
     if depth is None:
         depth = 1. / torch.clamp(disparity, min=1e-2)
