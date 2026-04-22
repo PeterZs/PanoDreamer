@@ -72,38 +72,56 @@ def normalize(x):
     return x / np.linalg.norm(x, axis=-1, keepdims=True)
 
 
-def create_camera_path(num_frames=120, radius=4.0):
+def create_camera_path(num_frames=120, radius=4.0, center=None, panorama_mode=False):
     """
-    Create circular camera path looking at origin.
+    Create circular camera path.
     
     Args:
         num_frames: Number of camera positions
-        radius: Distance from origin
+        radius: Distance from scene center (only used if panorama_mode=False)
+        center: [3] scene center (default: origin)
+        panorama_mode: If True, camera at origin looking outward (for panorama scenes).
+                       If False, camera orbits around center looking inward.
     
     Returns:
         poses: [num_frames, 4, 4] camera-to-world matrices
     """
-    up = np.array([0, 1, 0])
+    if center is None:
+        center = np.array([0, 0, 0])
+    else:
+        center = np.array(center)
+    
     poses = []
     
     for i in range(num_frames):
         theta = i * (2 * np.pi) / num_frames
         
-        # Camera position on circle in XZ plane
-        eye = np.array([radius * np.cos(theta), 0, radius * np.sin(theta)])
-        lookat = np.array([0, 0, 0])
-        
-        # Construct camera axes
-        w = normalize(lookat - eye)  # forward
-        u = normalize(np.cross(up, w))  # right
-        v = np.cross(w, u)  # up
-        
-        # Camera-to-world matrix
-        c2w = np.eye(4)
-        c2w[:3, 0] = u
-        c2w[:3, 1] = v
-        c2w[:3, 2] = w
-        c2w[:3, 3] = eye
+        if panorama_mode:
+            # Camera at origin, rotating around Y-axis to look outward
+            # This matches the training camera model for panorama scenes
+            R = np.array([
+                [np.cos(theta), 0, np.sin(theta)],
+                [0, 1, 0],
+                [-np.sin(theta), 0, np.cos(theta)]
+            ])
+            c2w = np.eye(4)
+            c2w[:3, :3] = R
+            c2w[:3, 3] = np.array([0, 0, 0])  # Camera at origin
+        else:
+            # Camera orbits around scene center, looking inward
+            up = np.array([0, 1, 0])
+            eye = center + np.array([radius * np.cos(theta), 0, radius * np.sin(theta)])
+            lookat = center
+            
+            w = normalize(lookat - eye)  # forward
+            u = normalize(np.cross(up, w))  # right
+            v = np.cross(w, u)  # up
+            
+            c2w = np.eye(4)
+            c2w[:3, 0] = u
+            c2w[:3, 1] = v
+            c2w[:3, 2] = w
+            c2w[:3, 3] = eye
         
         poses.append(c2w)
     
@@ -169,7 +187,7 @@ def render_frame(gaussians, c2w, H=512, W=512, focal=582.69, device='cuda'):
 
 @torch.no_grad()
 def render_video(gaussians, output_dir, num_frames=120, fps=60, radius=4.0,
-                 H=512, W=512, focal=582.69):
+                 H=512, W=512, focal=582.69, panorama_mode=False):
     """
     Render RGB, depth, and alpha videos.
     
@@ -178,14 +196,23 @@ def render_video(gaussians, output_dir, num_frames=120, fps=60, radius=4.0,
         output_dir: Output directory
         num_frames: Number of frames
         fps: Video frame rate
-        radius: Camera orbit radius
+        radius: Camera orbit radius (ignored if panorama_mode=True)
         H, W: Image dimensions
         focal: Focal length
+        panorama_mode: If True, camera at origin looking outward (for panorama scenes)
     """
-    print(f'[INFO] Rendering {num_frames} frames at {fps} fps')
-    print(f'[INFO] Camera orbit radius: {radius}')
+    # Compute scene center from Gaussian positions
+    means = gaussians['means']
+    scene_center = means.mean(dim=0).cpu().numpy()
     
-    poses = create_camera_path(num_frames, radius)
+    print(f'[INFO] Rendering {num_frames} frames at {fps} fps')
+    if panorama_mode:
+        print(f'[INFO] Panorama mode: camera at origin, rotating to look outward')
+    else:
+        print(f'[INFO] Scene center: [{scene_center[0]:.2f}, {scene_center[1]:.2f}, {scene_center[2]:.2f}]')
+        print(f'[INFO] Camera orbit radius: {radius}')
+    
+    poses = create_camera_path(num_frames, radius, center=scene_center, panorama_mode=panorama_mode)
     
     os.makedirs(output_dir, exist_ok=True)
     frames_dir = os.path.join(output_dir, 'frames')
@@ -255,6 +282,8 @@ def main():
                         help='Image height')
     parser.add_argument('--width', type=int, default=512,
                         help='Image width')
+    parser.add_argument('--panorama', action='store_true',
+                        help='Use panorama camera mode (camera at origin, looking outward)')
     
     args = parser.parse_args()
     
@@ -268,7 +297,8 @@ def main():
         radius=args.radius,
         H=args.height,
         W=args.width,
-        focal=args.focal
+        focal=args.focal,
+        panorama_mode=args.panorama
     )
     
     print('[INFO] Done!')
