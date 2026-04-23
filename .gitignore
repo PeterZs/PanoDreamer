@@ -42,7 +42,12 @@ utils_backup/
 
 # Reference/temporary scripts
 luciddreamer*.py
+gs_init*.py
+arguments.py
 unused/
+
+# Pipeline outputs
+output_pipeline/
 
 # IDE
 .vscode/

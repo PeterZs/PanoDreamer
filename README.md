@@ -48,7 +48,7 @@ This repository implements panorama generation and 3D scene creation:
 <p align="center">
   <img src="assets/example_wide_depth.png" alt="Depth estimation" width="100%">
   <br>
-  <em>Depth estimation with view stitching (bug needs to be fixed)</em>
+  <em>Depth estimation with view stitching</em>
 </p>
 
 ## Setup
@@ -74,10 +74,10 @@ mkdir -p checkpoints
 wget -P checkpoints https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
 
 # Download inpainting checkpoints for LDI generation
-# The original 3d-moments download.sh has broken links
-# Use our download script to get checkpoints from Google Drive
-pip install gdown
 python download_inpainting_ckpts.py
+
+# (Optional) Install MoGe V2 for improved metric depth
+uv pip install "git+https://github.com/microsoft/MoGe.git" --no-deps
 ```
 
 ## Usage
@@ -101,19 +101,28 @@ python multicondiffusion_panorama.py \
 ```
 
 ### 3. Depth Estimation
-Estimates depth for wide images or cylindrical panoramas.
-```bash
-# For wide images (perspective)
-python depth_estimation.py \
-  --input_image output/final_output.png \
-  --output_dir output_depth \
-  --mode wide
+Estimates depth for wide images or cylindrical panoramas. Multiple methods are available:
 
-# For 360° panoramas (cylindrical)
+```bash
+# DA V2 relative depth + DA V2 metric calibration (default)
 python depth_estimation.py \
   --input_image output/final_output.png \
   --output_dir output_depth \
   --mode panorama
+
+# DA V2 relative depth + MoGe V2 metric calibration (recommended, sharper edges)
+python depth_estimation.py \
+  --input_image output/final_output.png \
+  --output_dir output_depth \
+  --mode panorama \
+  --method dav2+moge
+
+# MoGe V2 direct metric + Poisson gradient merge (best depth range)
+python depth_estimation.py \
+  --input_image output/final_output.png \
+  --output_dir output_depth \
+  --mode panorama \
+  --method moge+poisson
 ```
 
 ### 4. LDI Generation
@@ -132,18 +141,26 @@ Optimizes a 3D Gaussian Splatting scene from panorama LDI layers.
 python train_gsplat.py \
   --ldi_dir output_ldi \
   --output scene_optimized.ply \
-  --num_iterations 300 \
-  --num_views 16
+  --num_iterations 3000 \
+  --init_opacity 0.5
 ```
 
 ### 6. 3DGS Rendering
-Renders 3D Gaussian Splatting scenes using gsplat (for visualization).
+Renders 3D Gaussian Splatting scenes using gsplat.
 ```bash
+# Panorama (rotate in place, matches training)
 python render_gsplat.py \
   --ply scene_optimized.ply \
   --output renders \
-  --num_frames 720 \
-  --radius 2.0
+  --panorama
+
+# Orbit (novel view, camera circles the scene)
+python render_gsplat.py \
+  --ply scene_optimized.ply \
+  --output renders \
+  --radius 5.0 \
+  --focal 1250 \
+  --camera_y 0
 ```
 
 ### Arguments
@@ -161,33 +178,34 @@ python render_gsplat.py \
 **Depth estimation** (`depth_estimation.py`):
 - `--input_image`: Input wide/panoramic image
 - `--output_dir`: Output directory
-- `--mode`: `wide` for perspective images, `panorama` for 360° cylindrical
+- `--mode`: `wide` or `panorama`
+- `--method`: `dav2` (default), `dav2+moge`, `moge`, or `moge+poisson`
 - `--iterations`: Number of alignment iterations (default: 15)
-- `--debug`: Save intermediate depth info
 
 **LDI generation** (`ldi_generation.py`):
 - `--input_image`: Input panorama image
 - `--input_depth`: Depth map (.npy file)
 - `--output_dir`: Output directory
 - `--num_layers`: Number of depth layers (default: 4)
-- `--debug`: Save layer visualizations
 
 **3DGS training** (`train_gsplat.py`):
 - `--ldi_dir`: Path to panorama LDI directory
-- `--output`: Output PLY file path (default: scene_optimized.ply)
-- `--num_iterations`: Number of optimization iterations (default: 300)
-- `--num_views`: Number of training views (default: 16)
-- `--lr`: Learning rate (default: 0.001)
-- `--focal`: Focal length (default: 582.69)
-- `--radius`: Camera orbit radius (default: 4.0)
+- `--output`: Output PLY file path
+- `--num_iterations`: Number of optimization iterations (default: 3000)
+- `--num_views`: Number of training views (default: 240)
+- `--init_opacity`: Initial Gaussian opacity (default: 0.5)
+- `--depth_weight`: Depth loss weight (default: 0.005)
+- `--fov`: Field of view in degrees (default: 44.702)
 
 **3DGS rendering** (`render_gsplat.py`):
 - `--ply`: Path to 3DGS PLY file
 - `--output`: Output directory
-- `--num_frames`: Number of frames (default: 120)
+- `--panorama`: Rotate-in-place mode (matches training cameras)
+- `--radius`: Camera orbit radius (default: 2.0)
+- `--focal`: Focal length (default: 622.61)
+- `--camera_y`: Camera height override for orbit mode
+- `--num_frames`: Number of frames (default: 720)
 - `--fps`: Video frame rate (default: 60)
-- `--radius`: Camera orbit radius (default: 4.0)
-- `--focal`: Focal length (default: 582.69)
 
 ## Acknowledgements
 
@@ -198,6 +216,7 @@ This codebase builds upon several excellent open-source projects:
 - **[3d-moments](https://github.com/google-research/3d-moments)** - Inpainting networks for layered depth images
 - **[Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-V2)** - Monocular depth estimation
 - **[gsplat](https://github.com/nerfstudio-project/gsplat)** - Python library for 3D Gaussian Splatting
+- **[MoGe](https://github.com/microsoft/moge)** - Metric depth estimation (optional, for improved depth calibration)
 
 We thank the authors for making their code publicly available.
 
