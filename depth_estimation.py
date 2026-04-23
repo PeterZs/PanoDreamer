@@ -27,7 +27,10 @@ from tqdm import tqdm
 import matplotlib.cm as cm
 
 from ropwr import RobustPWRegression
-from utils.depth_utilsv2 import estimate_depth, estimate_metric_depth, calibrate_relative_depth
+from utils.depth_utilsv2 import (
+    estimate_depth, estimate_metric_depth, estimate_depth_moge,
+    calibrate_relative_depth
+)
 from utils.depth_layering import get_depth_bins
 from utils.depth import colorize
 
@@ -138,7 +141,7 @@ def get_masks(depth, num_bins=5):
 
 
 def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10,
-                        metric_dataset='vkitti', debug=False):
+                        metric_dataset='vkitti', metric_model='dav2', debug=False):
     """
     Estimate depth for a wide perspective image (no cylindrical projection).
 
@@ -262,7 +265,10 @@ def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10,
     ref_start = view_starts[ref_idx]
     ref_image = image[:, ref_start:ref_start + view_size]
     ref_pil = Image.fromarray(ref_image)
-    metric_ref = estimate_metric_depth(ref_pil, dataset=metric_dataset)
+    if metric_model == 'moge':
+        metric_ref = estimate_depth_moge(ref_pil)
+    else:
+        metric_ref = estimate_metric_depth(ref_pil, dataset=metric_dataset)
     ref_depth = depth_full[:, ref_start:ref_start + view_size]
     scale, bias = calibrate_relative_depth(ref_depth, metric_ref)
     depth_full = scale * depth_full + bias
@@ -285,7 +291,7 @@ def estimate_wide_depth(image, save_dir, num_iterations=15, num_bins=10,
 
 def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10,
                             input_fov=44.701948991275390, mul_factor=12,
-                            metric_dataset='vkitti', debug=False):
+                            metric_dataset='vkitti', metric_model='dav2', debug=False):
     """
     Estimate depth for a cylindrical panorama (360°).
     
@@ -434,22 +440,71 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
     disp_pano_half = depth_pano[:, :w]
     depth_pano_half = 1.0 / np.maximum(disp_pano_half, 0.01)
 
-    # Calibrate to metric depth using a reference view
-    ref_start = w // 2 - 256
-    ref_image = image_pano_tiled[:, ref_start:ref_start + 512]
-    ref_tensor = torch.tensor(ref_image).permute(2, 0, 1)[None].to(device).float() / 255.
-    ref_persp_np = cyl_proj(ref_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
-    ref_persp_pil = Image.fromarray((ref_persp_np * 255).astype(np.uint8))
+    # Calibrate to metric depth using multiple reference views
+    num_calib_views = 8
+    calib_step = num_views // num_calib_views
+    log_rel_all, log_met_all = [], []
 
-    metric_ref = estimate_metric_depth(ref_persp_pil, dataset=metric_dataset)
+    # Tile disp_pano_half for wraparound access during calibration
+    disp_pano_tiled = np.concatenate([disp_pano_half, disp_pano_half], axis=1)
 
-    ref_disp_cyl = disp_pano_half[:, ref_start:ref_start + 512]
-    ref_disp_tensor = torch.tensor(ref_disp_cyl).float()[None, None].to(device)
-    ref_disp_persp = cyl_proj(ref_disp_tensor, input_focal).cpu().numpy()[0, 0]
-    ref_depth_persp = 1.0 / np.maximum(ref_disp_persp, 0.01)
+    print(f'[INFO] Calibrating with {num_calib_views} reference views (metric_model={metric_model})...')
+    for ci in range(num_calib_views):
+        vi = ci * calib_step
+        ref_start = w // 2 - 256 + step * vi
+        ref_image = image_pano_tiled[:, ref_start:ref_start + 512]
+        ref_tensor = torch.tensor(ref_image).permute(2, 0, 1)[None].to(device).float() / 255.
+        ref_persp_np = cyl_proj(ref_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
+        ref_persp_pil = Image.fromarray((ref_persp_np * 255).astype(np.uint8))
 
-    scale, bias = calibrate_relative_depth(ref_depth_persp, metric_ref)
-    depth_pano_half = scale * depth_pano_half + bias
+        if metric_model == 'moge':
+            metric_ref = estimate_depth_moge(ref_persp_pil)
+        else:
+            metric_ref = estimate_metric_depth(ref_persp_pil, dataset=metric_dataset)
+
+        ref_disp_cyl = disp_pano_tiled[:, ref_start:ref_start + 512]
+        ref_disp_tensor = torch.tensor(ref_disp_cyl).float()[None, None].to(device)
+        ref_disp_persp = cyl_proj(ref_disp_tensor, input_focal).cpu().numpy()[0, 0]
+        ref_depth_persp = 1.0 / np.maximum(ref_disp_persp, 0.01)
+
+        if ref_depth_persp.shape != metric_ref.shape:
+            metric_ref = cv2.resize(metric_ref, (ref_depth_persp.shape[1], ref_depth_persp.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+
+        valid = (ref_depth_persp > 0.1) & (metric_ref > 0.1) & np.isfinite(metric_ref)
+        if valid.sum() > 100:
+            log_rel_all.append(np.log(ref_depth_persp[valid]))
+            log_met_all.append(np.log(metric_ref[valid]))
+
+    # Robust scale+shift calibration in log space
+    log_rel = np.concatenate(log_rel_all)
+    log_met = np.concatenate(log_met_all)
+
+    # Check correlation direction
+    corr = np.corrcoef(log_rel, log_met)[0, 1]
+    print(f'[INFO] Log correlation: {corr:.3f}')
+
+    if corr > 0.1:
+        # Positive correlation: fit log(metric) = a * log(relative) + b
+        if len(log_rel) > 100000:
+            idx = np.random.choice(len(log_rel), 100000, replace=False)
+            log_rel_s, log_met_s = log_rel[idx], log_met[idx]
+        else:
+            log_rel_s, log_met_s = log_rel, log_met
+        A = np.stack([log_rel_s, np.ones_like(log_rel_s)], axis=1)
+        a, b = np.linalg.lstsq(A, log_met_s, rcond=None)[0]
+        a = max(a, 0.1)  # enforce positive slope
+        print(f'[INFO] Log-space fit: a={a:.4f}, b={b:.4f}')
+        log_depth = np.log(np.maximum(depth_pano_half, 0.01))
+        depth_pano_half = np.exp(a * log_depth + b)
+    else:
+        # Negative or weak correlation: use median ratio scaling
+        # This happens when DA V2 disparity-derived depth inverts the ordering
+        ratios = np.exp(log_met - log_rel)
+        scale = np.median(ratios)
+        print(f'[INFO] Median ratio calibration: scale={scale:.4f}')
+        depth_pano_half = depth_pano_half * scale
+
     depth_pano_half = np.maximum(depth_pano_half, 0.1)
     print(f'[INFO] Calibrated depth range: [{depth_pano_half.min():.2f}m, {depth_pano_half.max():.2f}m]')
 
@@ -465,6 +520,330 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
     print(f'[INFO] Saved: {save_dir}/depth_pano.png')
 
     return depth_pano_half
+
+
+def estimate_panorama_depth_moge(image_pano, save_dir, num_iterations=15, num_bins=10,
+                                  input_fov=44.701948991275390, mul_factor=12, debug=False):
+    """
+    Estimate panorama depth using MoGe V2 directly (metric depth, no calibration needed).
+    Same view extraction + stitching as DA V2 but with MoGe's metric output.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    os.makedirs(save_dir, exist_ok=True)
+    h, w = image_pano.shape[:2]
+    input_focal = fov2focal(input_fov * math.pi / 180, 512)
+    step = 384 // mul_factor
+    num_views = (w // step) + 1
+
+    image_pano_tiled = np.concatenate([image_pano, image_pano], axis=1)
+
+    print(f'[INFO] MoGe V2 panorama depth: {num_views} views, {num_iterations} alignment iterations')
+
+    depth_arr = np.zeros((num_views, h, 512), dtype=np.float32)
+
+    for view_i in tqdm(range(num_views), desc="MoGe depth"):
+        start = w // 2 - 256 + step * view_i
+        image_crop = image_pano_tiled[:, start:start + 512]
+        image_tensor = torch.tensor(image_crop).permute(2, 0, 1)[None].to(device).float() / 255.
+        image_proj = cyl_proj(image_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
+        image_proj = (np.clip(image_proj, 0, 1) * 255).astype(np.uint8)
+        depth_arr[view_i] = estimate_depth_moge(image_proj)
+
+    # Build validity masks and convert to log-depth for alignment
+    # Log-depth gives equal weight to each depth octave, preserving dynamic range
+    valid_arr = []
+    log_arr = np.zeros_like(depth_arr)
+    for view_i in range(num_views):
+        valid_mask = depth_arr[view_i] > 0.5
+        valid_arr.append(valid_mask)
+        log_arr[view_i] = np.where(valid_mask, np.log(depth_arr[view_i]), 0)
+
+    bins_arr = []
+    for view_i in range(num_views):
+        v = valid_arr[view_i]
+        if v.sum() < 100:
+            bins_arr.append(None)
+            continue
+        log_valid = log_arr[view_i][v]
+        num_actual = min(num_bins, max(2, len(np.unique(log_valid)) // 10))
+        bins = np.percentile(log_valid, np.linspace(0, 100, num_actual + 1))
+        bins_arr.append(bins)
+
+    log_pano = np.zeros((h, 2 * w), dtype=np.float32)
+    weight_pano = np.zeros((h, 2 * w), dtype=np.float32)
+
+    pw = RobustPWRegression(objective="l2", degree=1, monotonic_trend="ascending")
+    for iteration in range(num_iterations):
+        log_pano[:] = 0
+        weight_pano[:] = 0
+
+        for view_i in range(num_views):
+            start = w // 2 - 256 + step * view_i
+            end = start + 512
+            v = valid_arr[view_i]
+            log_pano[:, start:end] += log_arr[view_i] * v
+            weight_pano[:, start:end] += v
+
+        # Fold wraparound: views past column w wrap back to [0, w]
+        log_pano[:, :w] += log_pano[:, w:]
+        log_pano[:, w:] = log_pano[:, :w]
+        weight_pano[:, :w] += weight_pano[:, w:]
+        weight_pano[:, w:] = weight_pano[:, :w]
+
+        has_data = weight_pano > 0
+        log_pano[has_data] /= weight_pano[has_data]
+
+        if iteration == num_iterations - 1:
+            break
+
+        for view_i in range(num_views):
+            if bins_arr[view_i] is None:
+                continue
+            start = w // 2 - 256 + step * view_i
+            end = start + 512
+            v = valid_arr[view_i].flatten()
+            log_ref = log_pano[:, start:end].flatten()[v]
+            log_curr = log_arr[view_i].flatten()[v]
+            if len(log_ref) < 100:
+                continue
+            try:
+                pw.fit(log_curr, log_ref, bins_arr[view_i][1:-1])
+                full_pred = pw.predict(log_arr[view_i].flatten())
+                log_arr[view_i] = full_pred.reshape(log_arr[view_i].shape).astype(np.float32)
+                log_arr[view_i] *= valid_arr[view_i]
+            except Exception as e:
+                if debug:
+                    print(f"[WARNING] Alignment failed for view {view_i}: {e}")
+                continue
+
+    # Convert back to depth
+    depth_pano_half = np.where(log_pano[:, :w] != 0, np.exp(log_pano[:, :w]), 0)
+    depth_pano_half = np.maximum(depth_pano_half, 0.1)
+    print(f'[INFO] MoGe depth range: [{depth_pano_half.min():.2f}m, {depth_pano_half.max():.2f}m]')
+
+    np.save(f"{save_dir}/depth_pano.npy", depth_pano_half)
+    depth_normalized = (depth_pano_half - depth_pano_half.min()) / (depth_pano_half.max() - depth_pano_half.min() + 1e-6)
+    depth_colored = colorize(depth_normalized, cmap='turbo')
+    cv2.imwrite(f"{save_dir}/depth_pano.png", depth_colored[..., :3][..., ::-1])
+
+    print(f'[INFO] Saved: {save_dir}/depth_pano.npy')
+    print(f'[INFO] Saved: {save_dir}/depth_pano.png')
+    return depth_pano_half
+
+
+def _poisson_merge_cylindrical(depth_views, view_starts, pano_w, pano_h, view_w=512):
+    """
+    Merge overlapping depth views using Poisson integration on log-depth gradients.
+    Adapted from MoGe's merge_panorama_depth for cylindrical panoramas.
+    Wraps horizontally (360°), no wrap vertically.
+    """
+    from scipy.sparse import lil_matrix, vstack as sp_vstack
+    from scipy.sparse.linalg import lsmr
+    from scipy.ndimage import convolve
+
+    N = pano_h * pano_w
+    num_views = len(depth_views)
+
+    # Accumulate log-depth gradients from all views
+    grad_x_sum = np.zeros((pano_h, pano_w), dtype=np.float64)
+    grad_y_sum = np.zeros((pano_h, pano_w), dtype=np.float64)
+    grad_x_count = np.zeros((pano_h, pano_w), dtype=np.float64)
+    grad_y_count = np.zeros((pano_h, pano_w), dtype=np.float64)
+
+    for vi in range(num_views):
+        log_d = np.log(np.maximum(depth_views[vi], 0.01))
+        start = view_starts[vi]
+        mask = depth_views[vi] > 0.01
+
+        gx = log_d[:, :-1] - log_d[:, 1:]
+        mx = mask[:, :-1] & mask[:, 1:]
+        gy = log_d[:-1, :] - log_d[1:, :]
+        my = mask[:-1, :] & mask[1:, :]
+
+        for c in range(view_w - 1):
+            pc = (start + c) % pano_w
+            grad_x_sum[:, pc] += gx[:, c] * mx[:, c]
+            grad_x_count[:, pc] += mx[:, c]
+        for c in range(view_w):
+            pc = (start + c) % pano_w
+            grad_y_sum[:-1, pc] += gy[:, c] * my[:, c]
+            grad_y_count[:-1, pc] += my[:, c]
+
+    valid_gx = grad_x_count > 0
+    valid_gy = grad_y_count > 0
+    grad_x_avg = np.where(valid_gx, grad_x_sum / np.maximum(grad_x_count, 1), 0)
+    grad_y_avg = np.where(valid_gy, grad_y_sum / np.maximum(grad_y_count, 1), 0)
+
+    # Build sparse gradient system: x_i - x_j = grad for each valid pair
+    rows = []
+    cols_i = []
+    cols_j = []
+    vals = []
+    eq_idx = 0
+
+    # Horizontal gradients (wrap in x)
+    for r in range(pano_h):
+        for c in range(pano_w):
+            if valid_gx[r, c]:
+                c_next = (c + 1) % pano_w
+                rows.append(eq_idx)
+                cols_i.append(r * pano_w + c)
+                cols_j.append(r * pano_w + c_next)
+                vals.append(grad_x_avg[r, c])
+                eq_idx += 1
+
+    # Vertical gradients (no wrap)
+    for r in range(pano_h - 1):
+        for c in range(pano_w):
+            if valid_gy[r, c]:
+                rows.append(eq_idx)
+                cols_i.append(r * pano_w + c)
+                cols_j.append((r + 1) * pano_w + c)
+                vals.append(grad_y_avg[r, c])
+                eq_idx += 1
+
+    num_eqs = eq_idx
+    from scipy.sparse import coo_matrix
+    row_idx = np.array(rows + rows, dtype=np.int32)
+    col_idx = np.array(cols_i + cols_j, dtype=np.int32)
+    data = np.array([1.0] * num_eqs + [-1.0] * num_eqs, dtype=np.float64)
+    A = coo_matrix((data, (row_idx, col_idx)), shape=(num_eqs, N)).tocsr()
+    b = np.array(vals, dtype=np.float64)
+
+    # Initial guess from weighted average
+    depth_pano = np.zeros((pano_h, pano_w), dtype=np.float64)
+    weight = np.zeros((pano_h, pano_w), dtype=np.float64)
+    for vi in range(num_views):
+        start = view_starts[vi]
+        for c in range(view_w):
+            pc = (start + c) % pano_w
+            depth_pano[:, pc] += depth_views[vi][:, c]
+            weight[:, pc] += 1
+    valid = weight > 0
+    depth_pano[valid] /= weight[valid]
+    depth_pano[~valid] = 1.0
+    x0 = np.log(np.maximum(depth_pano, 0.01)).reshape(-1)
+
+    result, *_ = lsmr(A, b, x0=x0, atol=1e-5, btol=1e-5, show=False)
+    depth_result = np.exp(result.reshape(pano_h, pano_w))
+
+    return depth_result.astype(np.float32)
+
+
+def estimate_panorama_depth_moge_poisson(image_pano, save_dir, num_bins=10,
+                                          input_fov=44.701948991275390, mul_factor=12,
+                                          debug=False):
+    """
+    Estimate panorama depth using MoGe V2 + Poisson gradient merge.
+
+    Adapted from MoGe's panorama pipeline for cylindrical panoramas:
+    - Our cylindrical view extraction (cyl_proj)
+    - MoGe V2 metric depth per view
+    - Poisson integration on log-depth gradients for globally consistent merge
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    os.makedirs(save_dir, exist_ok=True)
+    h, w = image_pano.shape[:2]
+    input_focal = fov2focal(input_fov * math.pi / 180, 512)
+    step = 384 // mul_factor
+    num_views = (w // step) + 1
+
+    image_pano_tiled = np.concatenate([image_pano, image_pano], axis=1)
+
+    print(f'[INFO] MoGe V2 + Poisson merge: {num_views} views')
+
+    depth_views = []
+    view_starts = []
+
+    for view_i in tqdm(range(num_views), desc="MoGe depth"):
+        start = w // 2 - 256 + step * view_i
+        image_crop = image_pano_tiled[:, start:start + 512]
+        image_tensor = torch.tensor(image_crop).permute(2, 0, 1)[None].to(device).float() / 255.
+        image_proj = cyl_proj(image_tensor, input_focal).cpu().numpy()[0].transpose(1, 2, 0)
+        image_proj = (np.clip(image_proj, 0, 1) * 255).astype(np.uint8)
+        depth_view = estimate_depth_moge(image_proj)
+        depth_views.append(depth_view)
+        view_starts.append(start % w)
+
+    print('[INFO] Running Poisson merge on log-depth gradients...')
+    depth_pano_full = _poisson_merge_cylindrical(depth_views, view_starts, w, h, view_w=512)
+    depth_pano_full = np.maximum(depth_pano_full, 0.1)
+
+    print(f'[INFO] MoGe+Poisson depth range: [{depth_pano_full.min():.2f}m, {depth_pano_full.max():.2f}m]')
+
+    np.save(f"{save_dir}/depth_pano.npy", depth_pano_full)
+    depth_normalized = (depth_pano_full - depth_pano_full.min()) / (depth_pano_full.max() - depth_pano_full.min() + 1e-6)
+    depth_colored = colorize(depth_normalized, cmap='turbo')
+    cv2.imwrite(f"{save_dir}/depth_pano.png", depth_colored[..., :3][..., ::-1])
+
+    print(f'[INFO] Saved: {save_dir}/depth_pano.npy')
+    print(f'[INFO] Saved: {save_dir}/depth_pano.png')
+    return depth_pano_full
+
+
+def estimate_wide_depth_moge(image, save_dir, num_iterations=15, num_bins=10, debug=False):
+    """
+    Estimate depth for a wide perspective image using MoGe V2 directly.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    h, w = image.shape[:2]
+    view_size = min(h, 512)
+    overlap = view_size // 2
+    stride = view_size - overlap
+    num_views = max(1, (w - view_size) // stride + 1)
+    view_starts = [min(i * stride, w - view_size) for i in range(num_views)]
+
+    print(f'[INFO] MoGe V2 wide depth: {num_views} views, {num_iterations} alignment iterations')
+
+    depth_arr = np.zeros((num_views, h, view_size), dtype=np.float32)
+    for view_i in tqdm(range(num_views), desc="MoGe depth"):
+        start = view_starts[view_i]
+        crop = image[:, start:start + view_size]
+        depth_arr[view_i] = estimate_depth_moge(crop)
+
+    bins_arr = []
+    for view_i in range(num_views):
+        d_tensor = torch.tensor(depth_arr[view_i])[None, None]
+        bins = get_depth_bins(depth=d_tensor, num_bins=num_bins)
+        bins_arr.append(bins)
+
+    depth_full = np.zeros((h, w), dtype=np.float32)
+    weight_full = np.zeros((h, w), dtype=np.float32)
+
+    for iteration in range(num_iterations):
+        depth_full[:] = 0
+        weight_full[:] = 0
+        for view_i in range(num_views):
+            start = view_starts[view_i]
+            depth_full[:, start:start + view_size] += depth_arr[view_i]
+            weight_full[:, start:start + view_size] += 1
+        valid = weight_full > 0
+        depth_full[valid] /= weight_full[valid]
+        if iteration == num_iterations - 1:
+            break
+        for view_i in range(num_views):
+            start = view_starts[view_i]
+            depth_ref = depth_full[:, start:start + view_size]
+            depth_curr = depth_arr[view_i]
+            try:
+                pw = RobustPWRegression()
+                pw.fit(depth_curr.flatten(), depth_ref.flatten(), bins_arr[view_i][1:-1])
+                depth_arr[view_i] = pw.predict(depth_curr.flatten()).reshape(depth_curr.shape).astype(np.float32)
+            except Exception as e:
+                if debug:
+                    print(f"[WARNING] Alignment failed for view {view_i}: {e}")
+
+    depth_full = np.maximum(depth_full, 0.1)
+    print(f'[INFO] MoGe depth range: [{depth_full.min():.2f}m, {depth_full.max():.2f}m]')
+
+    np.save(f"{save_dir}/depth.npy", depth_full)
+    depth_normalized = (depth_full - depth_full.min()) / (depth_full.max() - depth_full.min() + 1e-6)
+    depth_colored = colorize(depth_normalized, cmap='turbo')
+    cv2.imwrite(f"{save_dir}/depth.png", depth_colored[..., :3][..., ::-1])
+
+    print(f'[INFO] Saved: {save_dir}/depth.npy')
+    print(f'[INFO] Saved: {save_dir}/depth.png')
+    return depth_full
 
 
 def main():
@@ -485,7 +864,14 @@ def main():
                         help='Field of view in degrees (panorama mode only)')
     parser.add_argument('--metric_dataset', type=str, default='vkitti',
                         choices=['vkitti', 'hypersim'],
-                        help='Metric depth model: vkitti (outdoor, 80m) or hypersim (indoor, 20m)')
+                        help='DA V2 metric depth model: vkitti (outdoor, 80m) or hypersim (indoor, 20m)')
+    parser.add_argument('--method', type=str, default='dav2',
+                        choices=['dav2', 'dav2+moge', 'moge', 'moge+poisson'],
+                        help='Depth method: '
+                             'dav2 = DA V2 relative + DA V2 metric calibration (original), '
+                             'dav2+moge = DA V2 relative + MoGe V2 metric calibration, '
+                             'moge = MoGe V2 direct metric + ropwr alignment, '
+                             'moge+poisson = MoGe V2 metric + Poisson gradient merge (adapted from MoGe panorama)')
     parser.add_argument('--debug', action='store_true',
                         help='Save debug info (large files)')
 
@@ -499,25 +885,75 @@ def main():
     print(f'[INFO] Mode: {args.mode}')
     print(f'[INFO] Output directory: {args.output_dir}')
     
-    if args.mode == 'wide':
-        depth = estimate_wide_depth(
-            image=image,
-            save_dir=args.output_dir,
-            num_iterations=args.iterations,
-            num_bins=args.num_bins,
-            metric_dataset=args.metric_dataset,
-            debug=args.debug
-        )
-    else:  # panorama
-        depth = estimate_panorama_depth(
+    print(f'[INFO] Method: {args.method}')
+
+    if args.method == 'moge+poisson':
+        assert args.mode == 'panorama', 'moge+poisson only supports panorama mode'
+        depth = estimate_panorama_depth_moge_poisson(
             image_pano=image,
             save_dir=args.output_dir,
-            num_iterations=args.iterations,
             num_bins=args.num_bins,
             input_fov=args.fov,
-            metric_dataset=args.metric_dataset,
             debug=args.debug
         )
+    elif args.method == 'moge':
+        if args.mode == 'panorama':
+            depth = estimate_panorama_depth_moge(
+                image_pano=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                input_fov=args.fov,
+                debug=args.debug
+            )
+        else:
+            depth = estimate_wide_depth_moge(
+                image=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                debug=args.debug
+            )
+    elif args.method == 'dav2+moge':
+        if args.mode == 'panorama':
+            depth = estimate_panorama_depth(
+                image_pano=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                input_fov=args.fov,
+                metric_model='moge',
+                debug=args.debug
+            )
+        else:
+            depth = estimate_wide_depth(
+                image=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                metric_model='moge',
+                debug=args.debug
+            )
+    else:  # dav2
+        if args.mode == 'panorama':
+            depth = estimate_panorama_depth(
+                image_pano=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                input_fov=args.fov,
+                metric_dataset=args.metric_dataset,
+                debug=args.debug
+            )
+        else:
+            depth = estimate_wide_depth(
+                image=image,
+                save_dir=args.output_dir,
+                num_iterations=args.iterations,
+                num_bins=args.num_bins,
+                metric_dataset=args.metric_dataset,
+                debug=args.debug
+            )
     
     print(f'[INFO] Done!')
 

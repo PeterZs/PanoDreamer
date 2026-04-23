@@ -120,6 +120,43 @@ def estimate_metric_depth(img, dataset='vkitti'):
     return depth
 
 
+_moge_model = None
+
+
+def _get_moge_model():
+    """Load MoGe V2 model on first use."""
+    global _moge_model
+    if _moge_model is None:
+        from moge.model.v2 import MoGeModel
+        print('[INFO] Loading MoGe V2 (vitl-normal)')
+        _moge_model = MoGeModel.from_pretrained('Ruicheng/moge-2-vitl-normal').to(DEVICE).eval()
+    return _moge_model
+
+
+def estimate_depth_moge(img):
+    """
+    Estimate metric depth using MoGe V2.
+
+    Args:
+        img: PIL Image or numpy array (RGB, uint8 or float32 0-1)
+
+    Returns:
+        depth: HxW numpy array of metric depth in meters
+    """
+    model = _get_moge_model()
+    img = np.asarray(img).astype(np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+    img_tensor = torch.tensor(img, dtype=torch.float32, device=DEVICE).permute(2, 0, 1)
+
+    with torch.no_grad():
+        output = model.infer(img_tensor)
+
+    depth = output['depth'].cpu().numpy()
+    depth = np.where(np.isfinite(depth), depth, 0.0)
+    return depth
+
+
 def calibrate_relative_depth(relative, metric, percentile=2):
     """
     Compute scale and bias to map relative depth to metric depth.
@@ -133,10 +170,13 @@ def calibrate_relative_depth(relative, metric, percentile=2):
     Returns:
         scale, bias: such that calibrated = scale * relative + bias
     """
-    rel_near = np.percentile(relative, percentile)
-    rel_far = np.percentile(relative, 100 - percentile)
-    met_near = np.percentile(metric, percentile)
-    met_far = np.percentile(metric, 100 - percentile)
+    valid = (relative > 0) & (metric > 0) & np.isfinite(relative) & np.isfinite(metric)
+    rel_valid = relative[valid]
+    met_valid = metric[valid]
+    rel_near = np.percentile(rel_valid, percentile)
+    rel_far = np.percentile(rel_valid, 100 - percentile)
+    met_near = np.percentile(met_valid, percentile)
+    met_far = np.percentile(met_valid, 100 - percentile)
 
     scale = (met_far - met_near) / (rel_far - rel_near + 1e-8)
     bias = met_near - scale * rel_near

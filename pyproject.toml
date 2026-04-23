@@ -7,7 +7,7 @@ dependencies = [
     "numpy",
     "transformers",
     "diffusers",
-    "torch",
+    "torch>=2.0,<2.10",
     "torchvision",
     "pillow",
     "tqdm",
@@ -23,6 +23,15 @@ dependencies = [
     "imageio-ffmpeg",
     "plyfile",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
