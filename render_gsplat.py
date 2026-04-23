@@ -233,24 +233,40 @@ def render_video(gaussians, output_dir, num_frames=120, fps=60, radius=4.0,
     
     turbo = colormaps.get_cmap('turbo')
     
+    # Pre-pass: sample a few frames to find stable depth range
+    sample_indices = np.linspace(0, num_frames - 1, min(8, num_frames), dtype=int)
+    depth_samples = []
+    for i in sample_indices:
+        c2w = poses[i]
+        _, d, _ = render_frame(gaussians, c2w, H=H, W=W, focal=focal)
+        d_np = d.cpu().numpy()
+        valid = d_np > 0
+        if valid.any():
+            depth_samples.append(d_np[valid])
+    if depth_samples:
+        all_depths = np.concatenate(depth_samples)
+        disp_samples = 1.0 / np.maximum(all_depths, 0.01)
+        disp_vmin = np.percentile(disp_samples, 2)
+        disp_vmax = np.percentile(disp_samples, 98)
+    else:
+        disp_vmin, disp_vmax = 0, 1
+
     for i in tqdm(range(num_frames), desc="Rendering"):
         c2w = poses[i]
         rgb, depth, alpha = render_frame(gaussians, c2w, H=H, W=W, focal=focal)
-        
+
         # RGB frame
         rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
         writer_rgb.append_data(rgb_np)
         cv2.imwrite(os.path.join(frames_dir, f'{i:04d}.png'), rgb_np[:, :, ::-1])
-        
-        # Depth visualization (turbo colormap)
+
+        # Depth visualization (disparity with fixed global range)
         depth_np = depth.cpu().numpy()
-        if depth_np.max() > depth_np.min():
-            depth_norm = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min())
-        else:
-            depth_norm = np.zeros_like(depth_np)
+        disp = 1.0 / np.maximum(depth_np, 0.01)
+        depth_norm = np.clip((disp - disp_vmin) / (disp_vmax - disp_vmin + 1e-8), 0, 1)
         depth_color = (turbo(depth_norm)[..., :3] * 255).astype(np.uint8)
         writer_depth.append_data(depth_color)
-        
+
         # Alpha frame
         alpha_np = (alpha.cpu().numpy() * 255).astype(np.uint8)
         writer_alpha.append_data(alpha_np)

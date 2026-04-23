@@ -436,17 +436,14 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
                     print(f"[WARNING] Alignment failed for view {view_i}: {e}")
                 continue
     
-    # Extract final half panorama (disparity space) and invert to depth
+    # Calibrate disparity → metric depth directly using multiple views
+    # DA V2 output is disparity-like (larger = nearer). Fit metric = f(1/disp) in log space.
     disp_pano_half = depth_pano[:, :w]
-    depth_pano_half = 1.0 / np.maximum(disp_pano_half, 0.01)
+    disp_pano_tiled = np.concatenate([disp_pano_half, disp_pano_half], axis=1)
 
-    # Calibrate to metric depth using multiple reference views
     num_calib_views = 8
     calib_step = num_views // num_calib_views
-    log_rel_all, log_met_all = [], []
-
-    # Tile disp_pano_half for wraparound access during calibration
-    disp_pano_tiled = np.concatenate([disp_pano_half, disp_pano_half], axis=1)
+    inv_disp_all, met_all = [], []
 
     print(f'[INFO] Calibrating with {num_calib_views} reference views (metric_model={metric_model})...')
     for ci in range(num_calib_views):
@@ -465,46 +462,34 @@ def estimate_panorama_depth(image_pano, save_dir, num_iterations=15, num_bins=10
         ref_disp_cyl = disp_pano_tiled[:, ref_start:ref_start + 512]
         ref_disp_tensor = torch.tensor(ref_disp_cyl).float()[None, None].to(device)
         ref_disp_persp = cyl_proj(ref_disp_tensor, input_focal).cpu().numpy()[0, 0]
-        ref_depth_persp = 1.0 / np.maximum(ref_disp_persp, 0.01)
 
-        if ref_depth_persp.shape != metric_ref.shape:
-            metric_ref = cv2.resize(metric_ref, (ref_depth_persp.shape[1], ref_depth_persp.shape[0]),
+        if ref_disp_persp.shape != metric_ref.shape:
+            metric_ref = cv2.resize(metric_ref, (ref_disp_persp.shape[1], ref_disp_persp.shape[0]),
                                     interpolation=cv2.INTER_NEAREST)
 
-        valid = (ref_depth_persp > 0.1) & (metric_ref > 0.1) & np.isfinite(metric_ref)
+        valid = (ref_disp_persp > 0.01) & (metric_ref > 0.5) & np.isfinite(metric_ref)
         if valid.sum() > 100:
-            log_rel_all.append(np.log(ref_depth_persp[valid]))
-            log_met_all.append(np.log(metric_ref[valid]))
+            inv_disp_all.append(1.0 / ref_disp_persp[valid])
+            met_all.append(metric_ref[valid])
 
-    # Robust scale+shift calibration in log space
-    log_rel = np.concatenate(log_rel_all)
-    log_met = np.concatenate(log_met_all)
-
-    # Check correlation direction
-    corr = np.corrcoef(log_rel, log_met)[0, 1]
-    print(f'[INFO] Log correlation: {corr:.3f}')
-
-    if corr > 0.1:
-        # Positive correlation: fit log(metric) = a * log(relative) + b
-        if len(log_rel) > 100000:
-            idx = np.random.choice(len(log_rel), 100000, replace=False)
-            log_rel_s, log_met_s = log_rel[idx], log_met[idx]
-        else:
-            log_rel_s, log_met_s = log_rel, log_met
-        A = np.stack([log_rel_s, np.ones_like(log_rel_s)], axis=1)
-        a, b = np.linalg.lstsq(A, log_met_s, rcond=None)[0]
-        a = max(a, 0.1)  # enforce positive slope
-        print(f'[INFO] Log-space fit: a={a:.4f}, b={b:.4f}')
-        log_depth = np.log(np.maximum(depth_pano_half, 0.01))
-        depth_pano_half = np.exp(a * log_depth + b)
+    # Fit in log space: log(metric) = a * log(1/disp) + b
+    log_inv_disp = np.log(np.concatenate(inv_disp_all))
+    log_met = np.log(np.concatenate(met_all))
+    if len(log_inv_disp) > 100000:
+        idx = np.random.choice(len(log_inv_disp), 100000, replace=False)
+        log_inv_disp_s, log_met_s = log_inv_disp[idx], log_met[idx]
     else:
-        # Negative or weak correlation: use median ratio scaling
-        # This happens when DA V2 disparity-derived depth inverts the ordering
-        ratios = np.exp(log_met - log_rel)
-        scale = np.median(ratios)
-        print(f'[INFO] Median ratio calibration: scale={scale:.4f}')
-        depth_pano_half = depth_pano_half * scale
+        log_inv_disp_s, log_met_s = log_inv_disp, log_met
 
+    corr = np.corrcoef(log_inv_disp_s, log_met_s)[0, 1]
+    A = np.stack([log_inv_disp_s, np.ones_like(log_inv_disp_s)], axis=1)
+    a, b = np.linalg.lstsq(A, log_met_s, rcond=None)[0]
+    a = max(a, 0.1)
+    print(f'[INFO] Calibration: log(metric) = {a:.4f} * log(1/disp) + {b:.4f}  (corr={corr:.3f})')
+
+    # Apply: metric_depth = exp(a * log(1/disp_pano) + b)
+    inv_disp_pano = 1.0 / np.maximum(disp_pano_half, 0.001)
+    depth_pano_half = np.exp(a * np.log(inv_disp_pano) + b)
     depth_pano_half = np.maximum(depth_pano_half, 0.1)
     print(f'[INFO] Calibrated depth range: [{depth_pano_half.min():.2f}m, {depth_pano_half.max():.2f}m]')
 
