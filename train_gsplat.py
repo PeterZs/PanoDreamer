@@ -886,7 +886,7 @@ def main():
                         help='Save initialized Gaussians without training')
     parser.add_argument('--scale_mult', type=float, default=2.0,
                         help='Gaussian scale as multiple of pixel footprint')
-    parser.add_argument('--init_opacity', type=float, default=0.05,
+    parser.add_argument('--init_opacity', type=float, default=0.5,
                         help='Initial opacity for all Gaussians')
     parser.add_argument('--freeze_positions', action='store_true',
                         help='Freeze Gaussian positions during training (appearance-only optimization)')

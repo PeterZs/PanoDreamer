@@ -101,7 +101,7 @@ def test_unproject_render_roundtrip():
     bg = torch.zeros(3, device=device)
 
     with torch.no_grad():
-        rgb, depth_r, alpha = render_gaussians(gaussians, camera, background=bg)
+        rgb, depth_r, alpha = render_gaussians(gaussians, camera, background=bg)[:3]
 
     # Should see red with high alpha
     mean_r = rgb[:, :, 0].mean().item()
@@ -145,10 +145,10 @@ def test_seam_consistency():
 
     with torch.no_grad():
         cam0 = create_camera(0.001, focal=focal, H=64, W=64, device=device)
-        rgb0, _, _ = render_gaussians(gaussians, cam0, background=bg)
+        rgb0, _, _ = render_gaussians(gaussians, cam0, background=bg)[:3]
 
         cam1 = create_camera(2 * math.pi - 0.001, focal=focal, H=64, W=64, device=device)
-        rgb1, _, _ = render_gaussians(gaussians, cam1, background=bg)
+        rgb1, _, _ = render_gaussians(gaussians, cam1, background=bg)[:3]
 
     diff = (rgb0 - rgb1).abs().mean().item()
     print(f"  Mean abs diff between theta≈0 and theta≈2π: {diff:.4f} (should be < 0.05)")
@@ -187,7 +187,7 @@ def test_toy_scene_depth_ordering():
     # Look at theta=0 (center of panorama) — should see blue (near) on left, green (far) on right
     with torch.no_grad():
         cam = create_camera(0.0, focal=focal, H=64, W=64, device=device)
-        rgb, _, _ = render_gaussians(gaussians, cam, background=bg)
+        rgb, _, _ = render_gaussians(gaussians, cam, background=bg)[:3]
 
     # Panorama u=0..127 maps to RIGHT side of camera at theta=0
     right_half = rgb[:, 32:, :]  # u≈0 direction: both blue(near) + green(far)
@@ -236,10 +236,10 @@ def test_per_layer_rendering():
         # Render only layer 0 (far, reversed_id = 1 for raw layer 0)
         # After reversal: raw 0→reversed 1, raw 1→reversed 0
         # max_layer=0 should give only reversed_id=0 = raw layer 1 = blue (near)
-        rgb_layer0, _, _ = render_gaussians(gaussians, cam, background=bg, max_layer=0)
+        rgb_layer0, _, _ = render_gaussians(gaussians, cam, background=bg, max_layer=0)[:3]
 
         # max_layer=1 should give both layers
-        rgb_both, _, _ = render_gaussians(gaussians, cam, background=bg, max_layer=1)
+        rgb_both, _, _ = render_gaussians(gaussians, cam, background=bg, max_layer=1)[:3]
 
     layer0_blue = rgb_layer0[:, :, 2].mean().item()
     layer0_red = rgb_layer0[:, :, 0].mean().item()
